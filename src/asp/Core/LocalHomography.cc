@@ -70,7 +70,10 @@ namespace asp {
     // We will split the subregion into N x N boxes, and average the
     // disparity in each box, to reduce the run-time.
     int N = 10;
-
+    // PIECEWISE ALIGNMENT - Ricardo Monteiro
+    // Testing the variable N
+    N = 1;
+    // END - PIECEWISE ALIGNMENT
     std::vector<int> partitionx, partitiony;
     split_n_into_k(disparity.cols(), std::min(disparity.cols(), N), partitionx);
     split_n_into_k(disparity.rows(), std::min(disparity.rows(), N), partitiony);

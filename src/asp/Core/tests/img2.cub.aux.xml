@@ -1,0 +1,10 @@
+<PAMDataset>
+  <SRS>GEOGCS["Geographic Coordinate System",DATUM["D_MARS",SPHEROID["MARS",3396190,0]],PRIMEM["Reference Meridian",0],UNIT["degree",0.0174532925199433]]</SRS>
+  <GeoTransform>  3.0000000000000000e+01,  1.0000000000000000e-02,  0.0000000000000000e+00, -3.5000000000000000e+01,  0.0000000000000000e+00, -1.0000000000000000e-02</GeoTransform>
+  <Metadata>
+    <MDI key="AREA_OR_POINT">Area</MDI>
+  </Metadata>
+  <PAMRasterBand band="1">
+    <NoDataValue>-1.00000000000000E+03</NoDataValue>
+  </PAMRasterBand>
+</PAMDataset>

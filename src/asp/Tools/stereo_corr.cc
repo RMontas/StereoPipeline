@@ -39,6 +39,35 @@ using namespace vw::stereo;
 using namespace asp;
 using namespace std;
 
+
+ /// Homography IP matching // Ricardo Monteiro - return ip matching
+  ///
+  /// This applies only the homography constraint. Not the best...
+  template <class Image1T, class Image2T>
+  bool homography_ip_matching1( vw::ImageViewBase<Image1T> const& image1,
+			       vw::ImageViewBase<Image2T> const& image2,
+			       int ip_per_tile,
+			       std::string const& output_name,
+			       int inlier_threshold=10,
+			       double nodata1 = std::numeric_limits<double>::quiet_NaN(),
+			       double nodata2 = std::numeric_limits<double>::quiet_NaN(),
+			       std::vector<ip::InterestPoint>& final_ip1 = NULL,
+ 			       std::vector<ip::InterestPoint>& final_ip2 = NULL );
+Vector2i
+  homography_rectification1( bool adjust_left_image_size,
+			    Vector2i const& left_size,
+			    Vector2i const& right_size,
+			    std::vector<ip::InterestPoint> const& left_ip,
+			    std::vector<ip::InterestPoint> const& right_ip,
+			    vw::Matrix<double>& left_matrix,
+			    vw::Matrix<double>& right_matrix,
+			    double threshRANSAC );
+bool check_homography_matrix(Matrix<double>       const& H,
+			       std::vector<Vector3> const& left_points,
+			       std::vector<Vector3> const& right_points,
+			       std::vector<size_t>  const& indices
+			       );
+
 /// Returns the properly cast cost mode type
 stereo::CostFunctionType get_cost_mode_value() {
   switch(stereo_settings().cost_mode) {
@@ -725,7 +754,7 @@ class SeededCorrelatorView : public ImageViewBase<SeededCorrelatorView> {
   DiskImageView<vw::uint8> m_right_mask;
   ImageViewRef<PixelMask<Vector2f> > m_sub_disp;
   ImageViewRef<PixelMask<Vector2i> > m_sub_disp_spread;
-  ImageView<Matrix3x3> const& m_local_hom;
+  ImageView<Matrix3x3> & m_local_hom;
 
   // Settings
   Vector2  m_upscale_factor;
@@ -750,16 +779,16 @@ public:
                         MaskType              const& right_mask,
                         DispSeedImageType     const& sub_disp,
                         SpreadImageType       const& sub_disp_spread,
-                        ImageView<Matrix3x3>  const& local_hom,
+                        ImageView<Matrix3x3>  & local_hom,
                         Vector2i const& kernel_size,
                         stereo::CostFunctionType cost_mode,
-                        int corr_timeout, double seconds_per_op) :
+                        int corr_timeout, double seconds_per_op):
     m_left_image(left_image.impl()), m_right_image(right_image.impl()),
     m_left_mask (left_mask.impl ()), m_right_mask (right_mask.impl ()),
     m_sub_disp(sub_disp.impl()), m_sub_disp_spread(sub_disp_spread.impl()),
     m_local_hom(local_hom),
     m_kernel_size(kernel_size),  m_cost_mode(cost_mode),
-    m_corr_timeout(corr_timeout), m_seconds_per_op(seconds_per_op){
+    m_corr_timeout(corr_timeout), m_seconds_per_op(seconds_per_op){ 
     m_upscale_factor[0] = double(m_left_image.cols()) / m_sub_disp.cols();
     m_upscale_factor[1] = double(m_left_image.rows()) / m_sub_disp.rows();
     m_seed_bbox = bounding_box( m_sub_disp );
@@ -784,9 +813,9 @@ public:
   /// Does the work
   typedef CropView<ImageView<pixel_type> > prerasterize_type;
   inline prerasterize_type prerasterize(BBox2i const& bbox) const {
-
+cout << "start of tile " << bbox << endl;
     bool use_local_homography = stereo_settings().use_local_homography;
-
+cout << "use_local_homography " << use_local_homography << endl;
     Matrix<double> lowres_hom  = math::identity_matrix<3>();
     Matrix<double> fullres_hom = math::identity_matrix<3>();
     ImageViewRef<InputPixelType> right_trans_img;
@@ -852,6 +881,92 @@ public:
         Vector3 dnscale( 1.0/m_upscale_factor[0], 1.0/m_upscale_factor[1], 1 );
         fullres_hom = diagonal_matrix(upscale)*lowres_hom*diagonal_matrix(dnscale);
 
+////////// Ricardo Monteiro
+ 	// overwrite local search range
+	local_search_range = stereo::get_disparity_range( disparity_in_box );
+	cout << "[Full resolution piecewise homography]" << endl;
+	float left_nodata_value  = numeric_limits<float>::quiet_NaN();
+  	float right_nodata_value = numeric_limits<float>::quiet_NaN();
+	const int inlier_threshold = 200*(15.0*stereo_settings().ip_inlier_factor);
+	std::vector<ip::InterestPoint> left_ip, right_ip;
+	bool success;
+	cout << "[stereo_settings().ip_per_tile = " << stereo_settings().ip_per_tile << "]" << endl;
+	cout << "[inlier_threshold = " << inlier_threshold << "]" << endl;
+	cout << "[bbox = " << bbox << "]" << endl;
+	cout << "[local_search_range.size() = " << local_search_range.size() << "]" << endl;
+
+	ImageView<float> tile_right_image = crop(m_right_image.impl(), bbox);
+	ImageView<float> tile_left_image = crop(m_left_image.impl(), bbox);
+	char outputName[30];
+	int ts = ASPGlobalOptions::corr_tile_size();
+	int W = bbox.min().x()/ts;
+	int H = bbox.min().y()/ts;
+	sprintf(outputName, "matches_%d_%d.tif", H, W);
+ 	success = homography_ip_matching1( tile_left_image, tile_right_image,
+                                          stereo_settings().ip_per_tile,
+                                          outputName, inlier_threshold,
+                                          left_nodata_value, right_nodata_value,
+					  left_ip, right_ip);	
+	cout << "[" << left_ip.size() << " matching points in the left image]" << endl;
+	cout << "[" << right_ip.size() << " matching points in the right image]" << endl;
+	if(success)
+	{
+	    cout << "[success!]" << endl;
+	    Matrix<double> left_matrix = math::identity_matrix<3>();
+	    Matrix<double> right_matrix = fullres_hom;
+	    try {
+		// adjust the ip to the resolution of the full image
+		for ( size_t i = 0; i < left_ip.size(); i++ ) {
+	    	    left_ip[i].x += bbox.min().x();
+	    	    left_ip[i].y += bbox.min().y();
+	    	    right_ip[i].x += bbox.min().x();
+	    	    right_ip[i].y += bbox.min().y();
+		}
+		sprintf(outputName, "matches_adj_%d_%d.tif", H, W);
+		double threshRANSAC = 4; // best results for 5kx5k wv using 4 (tested, 2, 4 and 10)
+		ip::write_binary_match_file(outputName, left_ip, right_ip); // write ip matches after adjustment
+	        homography_rectification1( false,
+                                local_search_range.size(), local_search_range.size(),
+                                left_ip, right_ip, left_matrix, right_matrix,
+				threshRANSAC );
+		// // if true use:
+		//right_matrix(0,2) -= left_matrix(0,2);
+      		//right_matrix(1,2) -= left_matrix(1,2);
+		fullres_hom = right_matrix;
+		//std::string local_hom_file = m_opt.out_prefix + "-local_hom.txt";
+    		//vw_out() << "[Writing: " << local_hom_file << "]\n";
+    		//write_local_homographies(local_hom_file, fullres_hom);
+		cout << "[updated fullres_hom]" << endl; 
+	    }
+	    catch ( const vw::ArgumentErr& e ){
+		fullres_hom = math::identity_matrix<3>();
+		//int ts = ASPGlobalOptions::corr_tile_size();
+        	//m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts) = fullres_hom;
+		//std::string local_hom_file = m_opt.out_prefix + "-local_hom.txt";
+    		//vw_out() << "[Writing: " << local_hom_file << "]\n";
+    		//write_local_homographies(local_hom_file, fullres_hom);
+		cout << "[updated fullres_hom with identity matrix]" << endl; 
+		
+	    }
+    	    catch ( const vw::math::RANSACErr& e ){
+		fullres_hom = math::identity_matrix<3>();
+		//int ts = ASPGlobalOptions::corr_tile_size();
+        	//m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts) = fullres_hom;
+		//std::string local_hom_file = m_opt.out_prefix + "-local_hom.txt";
+    		//vw_out() << "[Writing: " << local_hom_file << "]\n";
+    		//write_local_homographies(local_hom_file, fullres_hom);
+		cout << "[updated fullres_hom with identity matrix]" << endl; 
+	    }
+	    int ts = ASPGlobalOptions::corr_tile_size();
+            m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts) = fullres_hom;
+	    cout << "[" << fullres_hom << "]" << endl;
+	}else{
+	    cout << "[NO success!]" << endl;
+	    fullres_hom = math::identity_matrix<3>();
+	    int ts = ASPGlobalOptions::corr_tile_size();
+            m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts) = fullres_hom;
+	    cout << "[updated fullres_hom with identity matrix]" << endl; 
+	}
         ImageViewRef< PixelMask<InputPixelType> >
           right_trans_masked_img
           = transform (copy_mask( m_right_image.impl(),
@@ -860,6 +975,17 @@ public:
 	               m_left_image.impl().cols(), m_left_image.impl().rows());
         right_trans_img  = apply_mask(right_trans_masked_img);
         right_trans_mask = channel_cast_rescale<uint8>(select_channel(right_trans_masked_img, 1));
+// Ricardo Monteiro - output right_trans_img size and write the transformed tile itself to disk
+	cartography::GdalWriteOptions geo_opt;
+	
+	//char outputName[30];
+	ImageView<float> tile_right_trans_img = crop(right_trans_img.impl(), bbox);
+	ImageView<float> tile_left_trans_img = crop(m_left_image.impl(), bbox);
+	sprintf(outputName, "piecewiseHomography_R_%d_%d.tif", H, W);
+	block_write_gdal_image(outputName, tile_right_trans_img, geo_opt);
+	sprintf(outputName, "piecewiseHomography_L_%d_%d.tif", H, W);
+	block_write_gdal_image(outputName, tile_left_trans_img, geo_opt);
+	cout << "--------------------->[[[[tile_right_trans_img.cols() " << tile_right_trans_img.cols() << "tile_right_trans_img.rows() " << tile_right_trans_img.rows() << "]]]]<---------------------" << endl;
       } //endif use_local_homography
 
       local_search_range = grow_bbox_to_int(local_search_range);
@@ -895,6 +1021,7 @@ public:
     // Now we are ready to actually perform correlation
     const int rm_half_kernel = 5; // Filter kernel size used by CorrelationView
     if (use_local_homography){
+      cout << "[local_search_range " << local_search_range << "]"<< endl;
       typedef vw::stereo::PyramidCorrelationView<ImageType, ImageViewRef<InputPixelType>, 
                                                  MaskType,  ImageViewRef<vw::uint8     > > CorrView;
       CorrView corr_view( m_left_image,   right_trans_img,
@@ -913,6 +1040,7 @@ public:
                           sgm_subpixel_mode, sgm_search_buffer, stereo_settings().corr_memory_limit_mb,
                           stereo_settings().corr_blob_filter_area,
                           stereo_settings().stereo_debug );
+      cout << "end of tile " << bbox << endl;
       return corr_view.prerasterize(bbox);
     }else{
       typedef vw::stereo::PyramidCorrelationView<ImageType, ImageType, MaskType, MaskType > CorrView;
@@ -1027,7 +1155,7 @@ void stereo_correlation( ASPGlobalOptions& opt ) {
   ImageViewRef<PixelMask<Vector2f> > fullres_disparity =
     crop(SeededCorrelatorView( left_disk_image, right_disk_image, Lmask, Rmask,
                                sub_disp, sub_disp_spread, local_hom, kernel_size, 
-                               cost_mode, corr_timeout, seconds_per_op ), 
+                               cost_mode, corr_timeout, seconds_per_op),  
          trans_crop_win);
 
   // With SGM, we must do the entire image chunk as one tile. Otherwise,
@@ -1079,6 +1207,12 @@ void stereo_correlation( ASPGlobalOptions& opt ) {
 			        has_left_georef, left_georef,
 			        has_nodata, nodata, opt,
 			        TerminalProgressCallback("asp", "\t--> Correlation :") );
+  }
+// Ricardo Monteiro - overwrite the homogrpahies
+if ( stereo_settings().seed_mode > 0 && stereo_settings().use_local_homography ){
+    string local_hom_file = opt.out_prefix + "-local_hom.txt";
+    write_local_homographies(local_hom_file, local_hom);
+    cout << "[Writing homographies]" << endl; 
   }
 
   vw_out() << "\n[ " << current_posix_time_string() << " ] : CORRELATION FINISHED \n";
@@ -1132,4 +1266,171 @@ int main(int argc, char* argv[]) {
 
   return 0;
 }
+
+////// Ricardo Monteiro
+  // Homography IP matching - Ricardo Monteiro - return ip matching
+  //
+  // This applies only the homography constraint. Not the best...
+  template <class Image1T, class Image2T>
+  bool homography_ip_matching1( vw::ImageViewBase<Image1T> const& image1,
+			       vw::ImageViewBase<Image2T> const& image2,
+			       int ip_per_tile,
+			       std::string const& output_name,
+			       int inlier_threshold,
+			       double nodata1,
+			       double nodata2,
+			       std::vector<ip::InterestPoint>& final_ip1,
+ 			       std::vector<ip::InterestPoint>& final_ip2) {
+
+    using namespace vw;
+
+    std::vector<ip::InterestPoint> matched_ip1, matched_ip2;
+    detect_match_ip( matched_ip1, matched_ip2,
+		     image1.impl(), image2.impl(),
+		     ip_per_tile,
+		     nodata1, nodata2 );
+    if ( matched_ip1.size() == 0 || matched_ip2.size() == 0 )
+      return false;
+    std::vector<Vector3> ransac_ip1 = iplist_to_vectorlist(matched_ip1),
+			 ransac_ip2 = iplist_to_vectorlist(matched_ip2);
+    std::vector<size_t> indices;
+    try {
+      typedef math::RandomSampleConsensus<math::HomographyFittingFunctor, math::InterestPointErrorMetric> RansacT;
+      const int    MIN_NUM_OUTPUT_INLIERS = ransac_ip1.size()/2;
+      const int    NUM_ITERATIONS         = 100;
+      RansacT ransac( math::HomographyFittingFunctor(),
+		      math::InterestPointErrorMetric(), NUM_ITERATIONS,
+		      inlier_threshold,
+		      MIN_NUM_OUTPUT_INLIERS, true
+		      );
+      Matrix<double> H(ransac(ransac_ip2,ransac_ip1)); // 2 then 1 is used here for legacy reasons
+      //vw_out() << "\t--> Homography: " << H << "\n";
+      indices = ransac.inlier_indices(H,ransac_ip2,ransac_ip1);
+    } catch (const math::RANSACErr& e ) {
+      //vw_out() << "RANSAC Failed: " << e.what() << "\n";
+      return false;
+    }
+
+   // std::vector<ip::InterestPoint> final_ip1, final_ip2;
+    BOOST_FOREACH( size_t& index, indices ) {
+      final_ip1.push_back(matched_ip1[index]);
+      final_ip2.push_back(matched_ip2[index]);
+    }
+
+
+    //// DEBUG - Draw out the point matches pre-geometric filtering
+    //vw_out() << "\t    Writing IP debug image2! " << std::endl;
+    //write_match_image("InterestPointMatching__ip_matching_debug2.tif",
+    //                  image1, image2,
+    //                  final_ip1, final_ip2);
+
+    //vw_out() << "\t    * Writing match file: " << output_name << "\n";
+    //ip::write_binary_match_file(output_name, final_ip1, final_ip2);
+    return true;
+  }
+
+Vector2i
+  homography_rectification1( bool adjust_left_image_size,
+			    Vector2i const& left_size,
+			    Vector2i const& right_size,
+			    std::vector<ip::InterestPoint> const& left_ip,
+			    std::vector<ip::InterestPoint> const& right_ip,
+			    vw::Matrix<double>& left_matrix,
+			    vw::Matrix<double>& right_matrix,
+			    double threshRANSAC ) {
+    // Reformat the interest points for RANSAC
+    std::vector<Vector3>  right_copy = iplist_to_vectorlist(right_ip),
+			  left_copy  = iplist_to_vectorlist(left_ip);
+
+    double thresh_factor = stereo_settings().ip_inlier_factor; // 1/15 by default
+    
+    // Use RANSAC to determine a good homography transform between the images
+    math::RandomSampleConsensus<math::HomographyFittingFunctor, math::InterestPointErrorMetric>
+      ransac( math::HomographyFittingFunctor(),
+	      math::InterestPointErrorMetric(),
+	      100, // num iter
+              threshRANSAC * norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor), // inlier thresh 
+	      //threshRANSAC, // Ricardo Monteiro //////////
+	      left_copy.size()*2/3 // min output inliers
+	      );
+
+    std::cout << "[RANSAC old thresh = " << norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor) << "]\n";
+    std::cout << "[RANSAC new thresh = " << threshRANSAC << "]\n";
+
+    Matrix<double> H = ransac(right_copy, left_copy);
+    std::vector<size_t> indices = ransac.inlier_indices(H, right_copy, left_copy);
+
+    if(check_homography_matrix(H, left_copy, right_copy, indices)){
+    // Set right to a homography that has been refined just to our inliers
+    	left_matrix  = math::identity_matrix<3>();
+    	right_matrix = math::HomographyFittingFunctor()(right_copy, left_copy, H);
+    }else{
+	left_matrix  = math::identity_matrix<3>();
+    	right_matrix = math::identity_matrix<3>();;
+    }
+
+    // Work out the ideal render size
+    BBox2i output_bbox, right_bbox;
+    output_bbox.grow( Vector2i(0,0) );
+    output_bbox.grow( Vector2i(left_size.x(),0) );
+    output_bbox.grow( Vector2i(0,left_size.y()) );
+    output_bbox.grow( left_size );
+
+    if (adjust_left_image_size){
+      // Crop the left and right images to the shared region. This is
+      // done for efficiency.  It may not be always desirable though,
+      // as in this case we lose the one-to-one correspondence between
+      // original input left image pixels and output disparity/point
+      // cloud pixels.
+      Vector3 temp = right_matrix*Vector3(0,0,1);
+      temp /= temp.z();
+      right_bbox.grow( subvector(temp,0,2) );
+      temp = right_matrix*Vector3(right_size.x(),0,1);
+      temp /= temp.z();
+      right_bbox.grow( subvector(temp,0,2) );
+      temp = right_matrix*Vector3(0,right_size.y(),1);
+      temp /= temp.z();
+      right_bbox.grow( subvector(temp,0,2) );
+      temp = right_matrix*Vector3(right_size.x(),right_size.y(),1);
+      temp /= temp.z();
+      right_bbox.grow( subvector(temp,0,2) );
+
+      output_bbox.crop( right_bbox );
+
+      //  Move the ideal render size to be aligned up with origin
+      left_matrix (0,2) -= output_bbox.min().x();
+      right_matrix(0,2) -= output_bbox.min().x();
+      left_matrix (1,2) -= output_bbox.min().y();
+      right_matrix(1,2) -= output_bbox.min().y();
+    }
+
+    return Vector2i( output_bbox.width(), output_bbox.height() );
+  }
+
+bool check_homography_matrix(Matrix<double>       const& H,
+			       std::vector<Vector3> const& left_points,
+			       std::vector<Vector3> const& right_points,
+			       std::vector<size_t>  const& indices
+			       ){
+
+    // Sanity checks. If these fail, most likely the two images are too different
+    // for stereo to succeed.
+    if ( indices.size() < std::min( right_points.size(), left_points.size() )/2 ){
+      vw_out(WarningMessage) << "InterestPointMatching: The number of inliers is less "
+                             << "than 1/2 of the number of points. The inputs may be invalid.\n";
+	return false;
+    }
+
+    double det = fabs(H(0, 0)*H(1, 1) - H(0, 1)*H(1, 0));
+    if (det <= 0.1 || det >= 10.0){
+      vw_out(WarningMessage) << "InterestPointMatching: The determinant of the 2x2 submatrix "
+                             << "of the homography matrix " << H << " is " << det
+                             << ". There could be a large scale discrepancy among the input images "
+                             << "or the inputs may be an invalid stereo pair.\n";
+	return false;
+    }
+    return true;
+
+  }
+
 

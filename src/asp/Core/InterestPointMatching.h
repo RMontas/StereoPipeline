@@ -628,6 +628,64 @@ namespace asp {
     return true;
   }
 
+  // Detect and Match Interest Points
+  //
+  // This is not meant to be used directly. Please use ip matching
+/*  template <class Image1T, class Image2T>
+  void detect_match_ip( std::vector<vw::ip::InterestPoint>& matched_ip1,
+			std::vector<vw::ip::InterestPoint>& matched_ip2,
+			vw::ImageViewBase<Image1T> const& image1,
+			vw::ImageViewBase<Image2T> const& image2,
+			int ip_per_tile,
+			double nodata1,
+			double nodata2) {
+    using namespace vw;
+
+    // Detect Interest Points
+    ip::InterestPointList ip1, ip2;
+    detect_ip( ip1, ip2, image1.impl(), image2.impl(),
+	       ip_per_tile, nodata1, nodata2 );
+
+    // Match the interset points using the default matcher
+    vw_out() << "\t--> Matching interest points\n";
+
+    // Replace the IP lists with IP vectors
+    std::vector<vw::ip::InterestPoint> ip1_copy, ip2_copy;
+    ip1_copy.reserve( ip1.size() );
+    ip2_copy.reserve( ip2.size() );
+    std::copy( ip1.begin(), ip1.end(), std::back_inserter( ip1_copy ) );
+    std::copy( ip2.begin(), ip2.end(), std::back_inserter( ip2_copy ) );
+
+    DetectIpMethod detect_method = static_cast<DetectIpMethod>(stereo_settings().ip_matching_method);
+
+    // Best point must be closer than the next best point
+    vw_out() << "Uniqueness threshold: " << stereo_settings().ip_uniqueness_thresh << "\n";
+    const double uniqueness_threshold = (0.8/0.7)*stereo_settings().ip_uniqueness_thresh;  // adj
+    
+    if (detect_method != DETECT_IP_METHOD_ORB) {
+      // For all L2Norm distance metrics
+      ip::InterestPointMatcher<ip::L2NormMetric,ip::NullConstraint> matcher(uniqueness_threshold);
+      matcher( ip1_copy, ip2_copy, matched_ip1, matched_ip2,
+	       TerminalProgressCallback( "asp", "\t   Matching: " ));
+    }
+    else {
+      // For Hamming distance metrics
+      ip::InterestPointMatcher<ip::HammingMetric,ip::NullConstraint> matcher(uniqueness_threshold);
+      matcher( ip1_copy, ip2_copy, matched_ip1, matched_ip2,
+	       TerminalProgressCallback( "asp", "\t   Matching: " ));
+    }
+
+    ip::remove_duplicates( matched_ip1, matched_ip2 );
+
+    //// DEBUG - Draw out the point matches pre-geometric filtering
+    //vw_out() << "\t    Writing IP debug image! " << std::endl;
+    //write_match_image("InterestPointMatching__ip_matching_debug.tif",
+    //                  image1, image2,
+    //                  matched_ip1, matched_ip2);
+
+    vw_out() << "\n\t    Matched points: " << matched_ip1.size() << std::endl;
+  }*/
+
   // Smart IP matching that uses clustering on triangulation and
   // datum information to determine inliers.
   //

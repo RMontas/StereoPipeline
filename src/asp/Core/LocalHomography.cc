@@ -71,8 +71,8 @@ namespace asp {
     // disparity in each box, to reduce the run-time.
     int N = 10;
     // PIECEWISE ALIGNMENT - Ricardo Monteiro
-    // Testing the variable N
-    N = 1;
+    // Removing averaging 
+    //N = disparity.rows();
     // END - PIECEWISE ALIGNMENT
     std::vector<int> partitionx, partitiony;
     split_n_into_k(disparity.cols(), std::min(disparity.cols(), N), partitionx);

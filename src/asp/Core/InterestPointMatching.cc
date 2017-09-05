@@ -450,9 +450,13 @@ namespace asp {
       ransac( math::HomographyFittingFunctor(),
 	      math::InterestPointErrorMetric(),
 	      100, // num iter
-              norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor), // inlier thresh
+              norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor), // inlier thresh 
+	      //200, // Ricardo Monteiro //////////
 	      left_copy.size()*2/3 // min output inliers
 	      );
+
+    std::cout << "[RANSAC thresh = " << norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor) << "]\n";
+
     Matrix<double> H = ransac(right_copy, left_copy);
     std::vector<size_t> indices = ransac.inlier_indices(H, right_copy, left_copy);
     check_homography_matrix(H, left_copy, right_copy, indices);

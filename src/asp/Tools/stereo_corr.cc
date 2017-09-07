@@ -68,6 +68,8 @@ bool check_homography_matrix(Matrix<double>       const& H,
 			       std::vector<size_t>  const& indices
 			       );
 
+double calcAverageDeltaY(std::vector<ip::InterestPoint> const& left_points, std::vector<ip::InterestPoint> const& right_points);
+
 /// Returns the properly cast cost mode type
 stereo::CostFunctionType get_cost_mode_value() {
   switch(stereo_settings().cost_mode) {
@@ -755,6 +757,7 @@ class SeededCorrelatorView : public ImageViewBase<SeededCorrelatorView> {
   ImageViewRef<PixelMask<Vector2f> > m_sub_disp;
   ImageViewRef<PixelMask<Vector2i> > m_sub_disp_spread;
   ImageView<Matrix3x3> & m_local_hom;
+  ImageView<float>  & m_verticalDisp;
 
   // Settings
   Vector2  m_upscale_factor;
@@ -780,6 +783,7 @@ public:
                         DispSeedImageType     const& sub_disp,
                         SpreadImageType       const& sub_disp_spread,
                         ImageView<Matrix3x3>  & local_hom,
+ 			ImageView<float>  & verticalDisp, // Ricardo Monteiro / added verticalDisp
                         Vector2i const& kernel_size,
                         stereo::CostFunctionType cost_mode,
                         int corr_timeout, double seconds_per_op):
@@ -787,6 +791,7 @@ public:
     m_left_mask (left_mask.impl ()), m_right_mask (right_mask.impl ()),
     m_sub_disp(sub_disp.impl()), m_sub_disp_spread(sub_disp_spread.impl()),
     m_local_hom(local_hom),
+    m_verticalDisp(verticalDisp), // Ricardo Monteiro / added verticalDisp
     m_kernel_size(kernel_size),  m_cost_mode(cost_mode),
     m_corr_timeout(corr_timeout), m_seconds_per_op(seconds_per_op){ 
     m_upscale_factor[0] = double(m_left_image.cols()) / m_sub_disp.cols();
@@ -820,6 +825,8 @@ cout << "use_local_homography " << use_local_homography << endl;
     Matrix<double> fullres_hom = math::identity_matrix<3>();
     ImageViewRef<InputPixelType> right_trans_img;
     ImageViewRef<vw::uint8     > right_trans_mask;
+    double averageDeltaY = 100000;
+    double minAverageDeltaYTH = 2; // piecewise alignment is used if averageDeltaY is higher than this 
 
     bool do_round = true; // round integer disparities after transform
 
@@ -901,7 +908,7 @@ cout << "use_local_homography " << use_local_homography << endl;
 	int ts = ASPGlobalOptions::corr_tile_size();
 	int W = bbox.min().x()/ts;
 	int H = bbox.min().y()/ts;
-	sprintf(outputName, "matches_%d_%d.tif", H, W);
+	sprintf(outputName, "matches_%d_%d", H, W);
  	success = homography_ip_matching1( tile_left_image, tile_right_image,
                                           stereo_settings().ip_per_tile,
                                           outputName, inlier_threshold,
@@ -909,6 +916,13 @@ cout << "use_local_homography " << use_local_homography << endl;
 					  left_ip, right_ip);	
 	cout << "[" << left_ip.size() << " matching points in the left image]" << endl;
 	cout << "[" << right_ip.size() << " matching points in the right image]" << endl;
+	averageDeltaY = calcAverageDeltaY(left_ip, right_ip);
+	cout << "[" << averageDeltaY << " averageDeltaY after global alignment]" << endl;
+	if(averageDeltaY == -1 || minAverageDeltaYTH < 2){ 
+	    success = false;
+	    cout << "[Not using piecewise alignment on this tile because averageDeltaY = " << averageDeltaY << "]" << endl;
+	}
+	m_verticalDisp(bbox.min().x()/ts, bbox.min().y()/ts) = averageDeltaY;
 	if(success)
 	{
 	    cout << "[success!]" << endl;
@@ -922,8 +936,8 @@ cout << "use_local_homography " << use_local_homography << endl;
 	    	    right_ip[i].x += bbox.min().x();
 	    	    right_ip[i].y += bbox.min().y();
 		}
-		sprintf(outputName, "matches_adj_%d_%d.tif", H, W);
-		double threshRANSAC = 4; // best results for 5kx5k wv using 4 (tested, 2, 4 and 10)
+		sprintf(outputName, "matches_adj_%d_%d", H, W);
+		double threshRANSAC = 2; // best results for 5kx5k wv using 4 (tested, 2, 4 and 10)
 		ip::write_binary_match_file(outputName, left_ip, right_ip); // write ip matches after adjustment
 	        homography_rectification1( false,
                                 local_search_range.size(), local_search_range.size(),
@@ -933,28 +947,15 @@ cout << "use_local_homography " << use_local_homography << endl;
 		//right_matrix(0,2) -= left_matrix(0,2);
       		//right_matrix(1,2) -= left_matrix(1,2);
 		fullres_hom = right_matrix;
-		//std::string local_hom_file = m_opt.out_prefix + "-local_hom.txt";
-    		//vw_out() << "[Writing: " << local_hom_file << "]\n";
-    		//write_local_homographies(local_hom_file, fullres_hom);
 		cout << "[updated fullres_hom]" << endl; 
 	    }
 	    catch ( const vw::ArgumentErr& e ){
 		fullres_hom = math::identity_matrix<3>();
-		//int ts = ASPGlobalOptions::corr_tile_size();
-        	//m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts) = fullres_hom;
-		//std::string local_hom_file = m_opt.out_prefix + "-local_hom.txt";
-    		//vw_out() << "[Writing: " << local_hom_file << "]\n";
-    		//write_local_homographies(local_hom_file, fullres_hom);
 		cout << "[updated fullres_hom with identity matrix]" << endl; 
 		
 	    }
     	    catch ( const vw::math::RANSACErr& e ){
 		fullres_hom = math::identity_matrix<3>();
-		//int ts = ASPGlobalOptions::corr_tile_size();
-        	//m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts) = fullres_hom;
-		//std::string local_hom_file = m_opt.out_prefix + "-local_hom.txt";
-    		//vw_out() << "[Writing: " << local_hom_file << "]\n";
-    		//write_local_homographies(local_hom_file, fullres_hom);
 		cout << "[updated fullres_hom with identity matrix]" << endl; 
 	    }
 	    int ts = ASPGlobalOptions::corr_tile_size();
@@ -1137,6 +1138,7 @@ void stereo_correlation( ASPGlobalOptions& opt ) {
   }
 
   ImageView<Matrix3x3> local_hom;
+  ImageView<float> verticalDisp;
   if ( stereo_settings().seed_mode > 0 && stereo_settings().use_local_homography ){
     string local_hom_file = opt.out_prefix + "-local_hom.txt";
     read_local_homographies(local_hom_file, local_hom);
@@ -1154,7 +1156,9 @@ void stereo_correlation( ASPGlobalOptions& opt ) {
   // - Processing is limited to trans_crop_win for use with parallel_stereo.
   ImageViewRef<PixelMask<Vector2f> > fullres_disparity =
     crop(SeededCorrelatorView( left_disk_image, right_disk_image, Lmask, Rmask,
-                               sub_disp, sub_disp_spread, local_hom, kernel_size, 
+                               sub_disp, sub_disp_spread, local_hom, 
+				verticalDisp, // Ricardo Monteiro				
+				kernel_size, 
                                cost_mode, corr_timeout, seconds_per_op),  
          trans_crop_win);
 
@@ -1213,6 +1217,11 @@ if ( stereo_settings().seed_mode > 0 && stereo_settings().use_local_homography )
     string local_hom_file = opt.out_prefix + "-local_hom.txt";
     write_local_homographies(local_hom_file, local_hom);
     cout << "[Writing homographies]" << endl; 
+    // write average delta Y values afeter global alignment
+    string local_hom_file_deltaY = opt.out_prefix + "-local_hom_deltaY";
+    cartography::GdalWriteOptions geo_opt;
+    vw::cartography::block_write_gdal_image(local_hom_file_deltaY, verticalDisp, geo_opt);
+    
   }
 
   vw_out() << "\n[ " << current_posix_time_string() << " ] : CORRELATION FINISHED \n";
@@ -1350,8 +1359,10 @@ Vector2i
 	      math::InterestPointErrorMetric(),
 	      100, // num iter
               threshRANSAC * norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor), // inlier thresh 
+	      //norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor) > 1 ? threshRANSAC : (norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor)),
 	      //threshRANSAC, // Ricardo Monteiro //////////
 	      left_copy.size()*2/3 // min output inliers
+	      //left_copy.size()*1/10 // Ricardo Monteiro //////
 	      );
 
     std::cout << "[RANSAC old thresh = " << norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor) << "]\n";
@@ -1363,11 +1374,24 @@ Vector2i
     if(check_homography_matrix(H, left_copy, right_copy, indices)){
     // Set right to a homography that has been refined just to our inliers
     	left_matrix  = math::identity_matrix<3>();
-    	right_matrix = math::HomographyFittingFunctor()(right_copy, left_copy, H);
+    	right_matrix = math::HomographyFittingFunctor()(right_copy, left_copy, H); 
     }else{
 	left_matrix  = math::identity_matrix<3>();
     	right_matrix = math::identity_matrix<3>();;
     }
+
+// Ricardo Monteiro // calculate average deltat Y after piecewise alignment
+    std::vector<ip::InterestPoint> left_points, right_points;
+    int j = 0;
+    for( size_t i = 0; i < left_ip.size(); i++ ){
+	if(i == indices[j]){
+	    left_points.push_back(left_ip[i]);
+	    right_points.push_back(right_ip[i]);
+	    j++;
+	}
+    }
+    double averageDeltaY = calcAverageDeltaY(left_points, right_points);
+    cout << "[" << averageDeltaY << " averageDeltaY after piecewise alignment]" << endl;
 
     // Work out the ideal render size
     BBox2i output_bbox, right_bbox;
@@ -1422,7 +1446,7 @@ bool check_homography_matrix(Matrix<double>       const& H,
     }
 
     double det = fabs(H(0, 0)*H(1, 1) - H(0, 1)*H(1, 0));
-    if (det <= 0.1 || det >= 10.0){
+    if (det <= 0.5 || det >= 2.0){ // Ricardo Monteiro // Original values 0.1 and 10
       vw_out(WarningMessage) << "InterestPointMatching: The determinant of the 2x2 submatrix "
                              << "of the homography matrix " << H << " is " << det
                              << ". There could be a large scale discrepancy among the input images "
@@ -1432,5 +1456,19 @@ bool check_homography_matrix(Matrix<double>       const& H,
     return true;
 
   }
+
+double calcAverageDeltaY(std::vector<ip::InterestPoint> const& left_points, std::vector<ip::InterestPoint> const& right_points)
+{
+    double accuDiff = 0;
+
+    if(left_points.size()){
+        for ( size_t i = 0; i < left_points.size(); i++ ) {
+	    accuDiff += abs(left_points[i].y - right_points[i].y);
+        }
+        return accuDiff/left_points.size(); // average
+    }else{
+	return -1; // not valid
+    }
+}
 
 

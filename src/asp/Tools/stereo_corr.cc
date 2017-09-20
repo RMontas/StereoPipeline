@@ -61,14 +61,26 @@ Vector2i
 			    std::vector<ip::InterestPoint> const& right_ip,
 			    vw::Matrix<double>& left_matrix,
 			    vw::Matrix<double>& right_matrix,
-			    double threshRANSAC );
+			    double threshRANSAC, double minAvgDeltaY, BBox2i bbox );
 bool check_homography_matrix(Matrix<double>       const& H,
 			       std::vector<Vector3> const& left_points,
 			       std::vector<Vector3> const& right_points,
-			       std::vector<size_t>  const& indices
-			       );
-
+			       std::vector<size_t>  const& indices,
+			       double minAvgDeltaY, BBox2i bbox);
 double calcAverageDeltaY(std::vector<ip::InterestPoint> const& left_points, std::vector<ip::InterestPoint> const& right_points);
+double calcAverageDeltaY(std::vector<Vector3> const& left_points, std::vector<Vector3> const& right_points);
+
+vw::Matrix<double> piecewiseAlignment(ImageView<float> left_image, 
+			ImageView<float> right_image,
+			ImageView<float> tile_left_image,
+			ImageView<float> tile_right_image,	
+			BBox2i bbox);
+
+vw::Matrix<double> piecewiseAlignment_homography(ImageView<float> left_image, 
+			ImageView<float> right_image,
+			ImageView<float> tile_left_image,
+			ImageView<float> tile_right_image,	
+			BBox2i bbox);
 
 /// Returns the properly cast cost mode type
 stereo::CostFunctionType get_cost_mode_value() {
@@ -757,7 +769,6 @@ class SeededCorrelatorView : public ImageViewBase<SeededCorrelatorView> {
   ImageViewRef<PixelMask<Vector2f> > m_sub_disp;
   ImageViewRef<PixelMask<Vector2i> > m_sub_disp_spread;
   ImageView<Matrix3x3> & m_local_hom;
-  ImageView<float>  & m_verticalDisp;
 
   // Settings
   Vector2  m_upscale_factor;
@@ -783,7 +794,6 @@ public:
                         DispSeedImageType     const& sub_disp,
                         SpreadImageType       const& sub_disp_spread,
                         ImageView<Matrix3x3>  & local_hom,
- 			ImageView<float>  & verticalDisp, // Ricardo Monteiro / added verticalDisp
                         Vector2i const& kernel_size,
                         stereo::CostFunctionType cost_mode,
                         int corr_timeout, double seconds_per_op):
@@ -791,7 +801,6 @@ public:
     m_left_mask (left_mask.impl ()), m_right_mask (right_mask.impl ()),
     m_sub_disp(sub_disp.impl()), m_sub_disp_spread(sub_disp_spread.impl()),
     m_local_hom(local_hom),
-    m_verticalDisp(verticalDisp), // Ricardo Monteiro / added verticalDisp
     m_kernel_size(kernel_size),  m_cost_mode(cost_mode),
     m_corr_timeout(corr_timeout), m_seconds_per_op(seconds_per_op){ 
     m_upscale_factor[0] = double(m_left_image.cols()) / m_sub_disp.cols();
@@ -820,13 +829,10 @@ public:
   inline prerasterize_type prerasterize(BBox2i const& bbox) const {
 cout << "start of tile " << bbox << endl;
     bool use_local_homography = stereo_settings().use_local_homography;
-cout << "use_local_homography " << use_local_homography << endl;
     Matrix<double> lowres_hom  = math::identity_matrix<3>();
     Matrix<double> fullres_hom = math::identity_matrix<3>();
     ImageViewRef<InputPixelType> right_trans_img;
     ImageViewRef<vw::uint8     > right_trans_mask;
-    double averageDeltaY = 100000;
-    double minAverageDeltaYTH = 2; // piecewise alignment is used if averageDeltaY is higher than this 
 
     bool do_round = true; // round integer disparities after transform
 
@@ -850,7 +856,7 @@ cout << "use_local_homography " << use_local_homography << endl;
         lowres_hom = m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts);
         local_search_range = stereo::get_disparity_range
           (transform_disparities(do_round, seed_bbox,
-			     lowres_hom, disparity_in_box));
+			     lowres_hom, disparity_in_box)); 
       }
 
       bool has_sub_disp_spread = ( m_sub_disp_spread.cols() != 0 &&
@@ -887,87 +893,33 @@ cout << "use_local_homography " << use_local_homography << endl;
         Vector3 upscale(     m_upscale_factor[0],     m_upscale_factor[1], 1 );
         Vector3 dnscale( 1.0/m_upscale_factor[0], 1.0/m_upscale_factor[1], 1 );
         fullres_hom = diagonal_matrix(upscale)*lowres_hom*diagonal_matrix(dnscale);
-
-////////// Ricardo Monteiro
- 	// overwrite local search range
+////////// Ricardo Monteiro - code to overwrite fullres_hom
 	local_search_range = stereo::get_disparity_range( disparity_in_box );
-	cout << "[Full resolution piecewise homography]" << endl;
-	float left_nodata_value  = numeric_limits<float>::quiet_NaN();
-  	float right_nodata_value = numeric_limits<float>::quiet_NaN();
-	const int inlier_threshold = 200*(15.0*stereo_settings().ip_inlier_factor);
-	std::vector<ip::InterestPoint> left_ip, right_ip;
-	bool success;
-	cout << "[stereo_settings().ip_per_tile = " << stereo_settings().ip_per_tile << "]" << endl;
-	cout << "[inlier_threshold = " << inlier_threshold << "]" << endl;
-	cout << "[bbox = " << bbox << "]" << endl;
-	cout << "[local_search_range.size() = " << local_search_range.size() << "]" << endl;
-
-	ImageView<float> tile_right_image = crop(m_right_image.impl(), bbox);
-	ImageView<float> tile_left_image = crop(m_left_image.impl(), bbox);
+	cartography::GdalWriteOptions geo_opt;
 	char outputName[30];
 	int ts = ASPGlobalOptions::corr_tile_size();
 	int W = bbox.min().x()/ts;
 	int H = bbox.min().y()/ts;
-	sprintf(outputName, "matches_%d_%d", H, W);
- 	success = homography_ip_matching1( tile_left_image, tile_right_image,
-                                          stereo_settings().ip_per_tile,
-                                          outputName, inlier_threshold,
-                                          left_nodata_value, right_nodata_value,
-					  left_ip, right_ip);	
-	cout << "[" << left_ip.size() << " matching points in the left image]" << endl;
-	cout << "[" << right_ip.size() << " matching points in the right image]" << endl;
-	averageDeltaY = calcAverageDeltaY(left_ip, right_ip);
-	cout << "[" << averageDeltaY << " averageDeltaY after global alignment]" << endl;
-	if(averageDeltaY == -1 || minAverageDeltaYTH < 2){ 
-	    success = false;
-	    cout << "[Not using piecewise alignment on this tile because averageDeltaY = " << averageDeltaY << "]" << endl;
-	}
-	m_verticalDisp(bbox.min().x()/ts, bbox.min().y()/ts) = averageDeltaY;
-	if(success)
-	{
-	    cout << "[success!]" << endl;
-	    Matrix<double> left_matrix = math::identity_matrix<3>();
-	    Matrix<double> right_matrix = fullres_hom;
-	    try {
-		// adjust the ip to the resolution of the full image
-		for ( size_t i = 0; i < left_ip.size(); i++ ) {
-	    	    left_ip[i].x += bbox.min().x();
-	    	    left_ip[i].y += bbox.min().y();
-	    	    right_ip[i].x += bbox.min().x();
-	    	    right_ip[i].y += bbox.min().y();
-		}
-		sprintf(outputName, "matches_adj_%d_%d", H, W);
-		double threshRANSAC = 2; // best results for 5kx5k wv using 4 (tested, 2, 4 and 10)
-		ip::write_binary_match_file(outputName, left_ip, right_ip); // write ip matches after adjustment
-	        homography_rectification1( false,
-                                local_search_range.size(), local_search_range.size(),
-                                left_ip, right_ip, left_matrix, right_matrix,
-				threshRANSAC );
-		// // if true use:
-		//right_matrix(0,2) -= left_matrix(0,2);
-      		//right_matrix(1,2) -= left_matrix(1,2);
-		fullres_hom = right_matrix;
-		cout << "[updated fullres_hom]" << endl; 
-	    }
-	    catch ( const vw::ArgumentErr& e ){
-		fullres_hom = math::identity_matrix<3>();
-		cout << "[updated fullres_hom with identity matrix]" << endl; 
-		
-	    }
-    	    catch ( const vw::math::RANSACErr& e ){
-		fullres_hom = math::identity_matrix<3>();
-		cout << "[updated fullres_hom with identity matrix]" << endl; 
-	    }
-	    int ts = ASPGlobalOptions::corr_tile_size();
-            m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts) = fullres_hom;
-	    cout << "[" << fullres_hom << "]" << endl;
-	}else{
-	    cout << "[NO success!]" << endl;
-	    fullres_hom = math::identity_matrix<3>();
-	    int ts = ASPGlobalOptions::corr_tile_size();
-            m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts) = fullres_hom;
-	    cout << "[updated fullres_hom with identity matrix]" << endl; 
-	}
+	ImageView<float> tile_right_image = crop(m_right_image.impl(), bbox);
+	ImageView<float> tile_left_image = crop(m_left_image.impl(), bbox);
+	sprintf(outputName, "tile_R_%d_%d.tif", H, W);
+	block_write_gdal_image(outputName, tile_right_image, geo_opt);
+	sprintf(outputName, "tile_L_%d_%d.tif", H, W);
+	block_write_gdal_image(outputName, tile_left_image, geo_opt);
+	//fullres_hom = piecewiseAlignment(m_left_image.impl(), m_right_image.impl(), tile_left_image, tile_right_image, bbox);
+	fullres_hom = piecewiseAlignment_homography(m_left_image.impl(), m_right_image.impl(), tile_left_image.impl(), tile_right_image.impl(), bbox);
+
+	m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts) = fullres_hom;
+	cout << "[tile(" << H << "," << W << " local_search_range = " << local_search_range << endl;
+	//local_search_range = stereo::get_disparity_range
+    //      (transform_disparities(do_round, seed_bbox,
+	//		     fullres_hom, disparity_in_box)); 
+	cout << "[tile(" <<  H << "," << W << " local_search_range (after H) = " << local_search_range << endl;
+	if(fullres_hom != math::identity_matrix<3>())
+		local_search_range.expand(5);
+	cout << "[tile(" <<  H << "," << W << " local_search_range (after H and adding 5) = " << local_search_range << endl;
+	cout << "[tile(" << H << "," << W << ") " << fullres_hom << "]" << endl;
+/////
         ImageViewRef< PixelMask<InputPixelType> >
           right_trans_masked_img
           = transform (copy_mask( m_right_image.impl(),
@@ -976,17 +928,16 @@ cout << "use_local_homography " << use_local_homography << endl;
 	               m_left_image.impl().cols(), m_left_image.impl().rows());
         right_trans_img  = apply_mask(right_trans_masked_img);
         right_trans_mask = channel_cast_rescale<uint8>(select_channel(right_trans_masked_img, 1));
-// Ricardo Monteiro - output right_trans_img size and write the transformed tile itself to disk
-	cartography::GdalWriteOptions geo_opt;
-	
-	//char outputName[30];
-	ImageView<float> tile_right_trans_img = crop(right_trans_img.impl(), bbox);
+
+//// write ind tiles
+	ImageView<float> tile_right_trans_img = crop(right_trans_img.impl(), bbox); // because crop is called with an imageview variable, the right trans img is actually tranformed when ASP is reading the image
 	ImageView<float> tile_left_trans_img = crop(m_left_image.impl(), bbox);
 	sprintf(outputName, "piecewiseHomography_R_%d_%d.tif", H, W);
 	block_write_gdal_image(outputName, tile_right_trans_img, geo_opt);
 	sprintf(outputName, "piecewiseHomography_L_%d_%d.tif", H, W);
 	block_write_gdal_image(outputName, tile_left_trans_img, geo_opt);
-	cout << "--------------------->[[[[tile_right_trans_img.cols() " << tile_right_trans_img.cols() << "tile_right_trans_img.rows() " << tile_right_trans_img.rows() << "]]]]<---------------------" << endl;
+/////
+
       } //endif use_local_homography
 
       local_search_range = grow_bbox_to_int(local_search_range);
@@ -1022,7 +973,6 @@ cout << "use_local_homography " << use_local_homography << endl;
     // Now we are ready to actually perform correlation
     const int rm_half_kernel = 5; // Filter kernel size used by CorrelationView
     if (use_local_homography){
-      cout << "[local_search_range " << local_search_range << "]"<< endl;
       typedef vw::stereo::PyramidCorrelationView<ImageType, ImageViewRef<InputPixelType>, 
                                                  MaskType,  ImageViewRef<vw::uint8     > > CorrView;
       CorrView corr_view( m_left_image,   right_trans_img,
@@ -1138,7 +1088,6 @@ void stereo_correlation( ASPGlobalOptions& opt ) {
   }
 
   ImageView<Matrix3x3> local_hom;
-  ImageView<float> verticalDisp;
   if ( stereo_settings().seed_mode > 0 && stereo_settings().use_local_homography ){
     string local_hom_file = opt.out_prefix + "-local_hom.txt";
     read_local_homographies(local_hom_file, local_hom);
@@ -1156,9 +1105,7 @@ void stereo_correlation( ASPGlobalOptions& opt ) {
   // - Processing is limited to trans_crop_win for use with parallel_stereo.
   ImageViewRef<PixelMask<Vector2f> > fullres_disparity =
     crop(SeededCorrelatorView( left_disk_image, right_disk_image, Lmask, Rmask,
-                               sub_disp, sub_disp_spread, local_hom, 
-				verticalDisp, // Ricardo Monteiro				
-				kernel_size, 
+                               sub_disp, sub_disp_spread, local_hom, kernel_size, 
                                cost_mode, corr_timeout, seconds_per_op),  
          trans_crop_win);
 
@@ -1217,11 +1164,6 @@ if ( stereo_settings().seed_mode > 0 && stereo_settings().use_local_homography )
     string local_hom_file = opt.out_prefix + "-local_hom.txt";
     write_local_homographies(local_hom_file, local_hom);
     cout << "[Writing homographies]" << endl; 
-    // write average delta Y values afeter global alignment
-    string local_hom_file_deltaY = opt.out_prefix + "-local_hom_deltaY";
-    cartography::GdalWriteOptions geo_opt;
-    vw::cartography::block_write_gdal_image(local_hom_file_deltaY, verticalDisp, geo_opt);
-    
   }
 
   vw_out() << "\n[ " << current_posix_time_string() << " ] : CORRELATION FINISHED \n";
@@ -1277,6 +1219,160 @@ int main(int argc, char* argv[]) {
 }
 
 ////// Ricardo Monteiro
+vw::Matrix<double> piecewiseAlignment_homography(ImageView<float> left_image, 
+			ImageView<float> right_image,
+			ImageView<float> tile_left_image,
+			ImageView<float> tile_right_image,	
+			BBox2i bbox)
+{
+	using namespace vw;
+
+	double threshPiecewiseAlignment = 3.0;
+	double avgDeltaY = -1.0;
+	double threshRANSAC = 1.0;
+
+	Matrix<double> H;
+	double left_nodata_value  = numeric_limits<double>::quiet_NaN();
+  	double right_nodata_value = numeric_limits<double>::quiet_NaN();
+    std::vector<ip::InterestPoint> matched_ip1, matched_ip2;
+	std::vector<ip::InterestPoint> matchedRANSAC_ip1,matchedRANSAC_ip2;
+	std::vector<ip::InterestPoint> matchedRANSAC_final_ip1, matchedRANSAC_final_ip2;
+	ip::InterestPoint aux_r_ip, aux_l_ip;
+	bool success = false;
+	char outputName[30]; // DEBUG
+	int X = bbox.min().x()/ASPGlobalOptions::corr_tile_size();
+	int Y = bbox.min().y()/ASPGlobalOptions::corr_tile_size();
+	// detect and match ips
+	sprintf(outputName, "matches_%d_%d", Y, X); // DEBUG
+    try { success = homography_ip_matching1( tile_left_image, tile_right_image,
+                                          stereo_settings().ip_per_tile,
+                                          outputName, threshRANSAC, // before it was inlier_threshold
+                                          left_nodata_value, right_nodata_value,
+					  						matchedRANSAC_ip1, matchedRANSAC_ip2); }catch(...){}
+
+	avgDeltaY = calcAverageDeltaY(matchedRANSAC_ip1, matchedRANSAC_ip2); // estimate global alignment
+	cout << "[tile(" << Y << "," << X << ") avgDeltaY after global alignment = " << avgDeltaY << "]" << endl; // DEBUG
+	if(avgDeltaY != -1 || avgDeltaY >= threshPiecewiseAlignment){ // if the alignment can be improved
+		for ( size_t i = 0; i < matchedRANSAC_ip1.size(); i++ ) { // adjust ip matches to tile
+				//cout << "[tile(" << Y << "," << X << " matchedRANSAC " << matchedRANSAC_ip2[i].y << " " << matchedRANSAC_ip2[i].x << "]" << endl; // DEBUG
+	    	    matchedRANSAC_ip1[i].x += bbox.min().x();
+	    	    matchedRANSAC_ip1[i].y += bbox.min().y();
+	    	    matchedRANSAC_ip2[i].x += bbox.min().x();
+	    	    matchedRANSAC_ip2[i].y += bbox.min().y();
+		}
+		sprintf(outputName, "matches_adj_%d_%d", Y, X); // DEBUG
+		ip::write_binary_match_file(outputName, matchedRANSAC_ip1, matchedRANSAC_ip2); // DEBUG
+		cout << "[tile(" << Y << "," << X << ")" << matchedRANSAC_ip1.size() << " matching points]" << endl;
+		std::vector<Vector3> ransac_ip1 = iplist_to_vectorlist(matchedRANSAC_ip1), ransac_ip2 = iplist_to_vectorlist(matchedRANSAC_ip2);
+		std::vector<size_t> indices;
+		// RANSAC
+		try {
+			// use RANSAC to try to fit a homography with the ip matches
+			typedef math::RandomSampleConsensus<math::HomographyFittingFunctor, math::InterestPointErrorMetric> RansacT;
+		  	const int    MIN_NUM_OUTPUT_INLIERS = ransac_ip1.size()/2;
+		   // const int    MIN_NUM_OUTPUT_INLIERS = 4;
+		  	const int    NUM_ITERATIONS         = 200;
+		  	RansacT ransac( math::HomographyFittingFunctor(), math::InterestPointErrorMetric(), NUM_ITERATIONS,
+				  threshRANSAC, MIN_NUM_OUTPUT_INLIERS, true );
+		  	H = ransac(ransac_ip2,ransac_ip1); // 2 then 1 is used here for legacy reasons
+			indices = ransac.inlier_indices(H,ransac_ip2,ransac_ip1);
+			BOOST_FOREACH( size_t& index, indices ){
+				aux_l_ip.x = ransac_ip1[index].x(); // DEBUG
+    			aux_l_ip.y = ransac_ip1[index].y(); // DEBUG
+    			aux_r_ip.x = ransac_ip2[index].x(); // DEBUG
+    			aux_r_ip.y = ransac_ip2[index].y(); // DEBUG
+				matchedRANSAC_final_ip1.push_back(aux_r_ip); // DEBUG
+				matchedRANSAC_final_ip2.push_back(aux_l_ip); // DEBUG
+			}
+			cout << "[tile(" << Y << "," << X << ")" << matchedRANSAC_final_ip1.size() << " matching points after H]" << endl;	
+		} catch ( ... ) {
+		  	return math::identity_matrix<3>();
+		}
+
+		// check H
+		//if(check_homography_matrix(H, iplist_to_vectorlist(matchedRANSAC_final_ip1), iplist_to_vectorlist(matchedRANSAC_final_ip2), indices, avgDeltaY, bbox))
+		if(check_homography_matrix(H, ransac_ip1, ransac_ip2, indices, avgDeltaY, bbox))
+			//return H; // good H
+			return math::HomographyFittingFunctor()(ransac_ip2, ransac_ip1, H);
+		else
+			return math::identity_matrix<3>(); // bad H
+	}else // if the alignment cannot be improved
+		return math::identity_matrix<3>();
+}
+
+
+
+vw::Matrix<double> piecewiseAlignment(ImageView<float> left_image, 
+			ImageView<float> right_image,
+			ImageView<float> tile_left_image,
+			ImageView<float> tile_right_image,	
+			BBox2i bbox)
+{
+	vw::Matrix<double> fullres_hom;
+	float left_nodata_value  = numeric_limits<float>::quiet_NaN();
+  	float right_nodata_value = numeric_limits<float>::quiet_NaN();
+	std::vector<ip::InterestPoint> left_ip, right_ip;
+	bool success = false;
+	char outputName[30];
+	int ts = ASPGlobalOptions::corr_tile_size();
+	int W = bbox.min().x()/ts;
+	int H = bbox.min().y()/ts;
+	double avgDeltaY = -1.0/*, avgDeltaY_afterPiecewise = -1.0*/;
+	double threshRANSAC = 1.0;
+	double threshPiecewiseAlignment = 3.0;
+	sprintf(outputName, "matches_%d_%d", H, W);
+	try { success = homography_ip_matching1( tile_left_image, tile_right_image,
+                                          stereo_settings().ip_per_tile,
+                                          outputName, threshRANSAC, // before it was inlier_threshold
+                                          left_nodata_value, right_nodata_value,
+					  left_ip, right_ip); }catch(...){}
+	cout << "[tile(" << H << "," << W << ")" << left_ip.size() << " matching points]" << endl;
+        //for(size_t i = 0; i < right_ip.size(); i++)
+           //cout << "ip matches after ip match with RANSAC " << right_ip[i].y << "\n";
+	avgDeltaY = calcAverageDeltaY(left_ip, right_ip);
+	if(avgDeltaY == -1 || avgDeltaY < threshPiecewiseAlignment)
+	   success = false;
+	cout << "[tile(" << H << "," << W << ") avgDeltaY after global alignment = " << avgDeltaY << "]" << endl;
+	if(success)
+	{
+	    cout << "[tile(" << H << "," << W << ") success!]" << endl;
+	    Matrix<double> left_matrix = math::identity_matrix<3>();
+	    Matrix<double> right_matrix = fullres_hom;
+	    try {
+		// adjust the ip to the resolution of the full image
+		for ( size_t i = 0; i < left_ip.size(); i++ ) {
+	    	    left_ip[i].x += bbox.min().x();
+	    	    left_ip[i].y += bbox.min().y();
+	    	    right_ip[i].x += bbox.min().x();
+	    	    right_ip[i].y += bbox.min().y();
+		}
+		sprintf(outputName, "matches_adj_%d_%d.tif", H, W);
+		 
+		ip::write_binary_match_file(outputName, left_ip, right_ip); // write ip matches after adjustment
+	        homography_rectification1( false,
+                                left_image.get_size(), right_image.get_size(),
+                                left_ip, right_ip, left_matrix, right_matrix, 
+				threshRANSAC, avgDeltaY, bbox );
+		// // if true use:
+		//right_matrix(0,2) -= left_matrix(0,2);
+      		//right_matrix(1,2) -= left_matrix(1,2); 
+		fullres_hom = right_matrix; // overwrite fullres_hom
+		cout << "[tile(" << H << "," << W << ") updated fullres_hom]" << endl; 
+	    }
+    	    catch ( ... ){
+		fullres_hom = math::identity_matrix<3>(); // overwrite fullres_hom
+		cout << "[tile(" << H << "," << W << ") updated fullres_hom with identity matrix]" << endl; 
+	    }
+	    cout << "[tile(" << H << "," << W << ") " << fullres_hom << "]" << endl;
+	}else{
+	    cout << "[tile(" << H << "," << W << ") NO success!]" << endl;
+	    fullres_hom = math::identity_matrix<3>(); // overwrite fullres_hom
+	    cout << "[tile(" << H << "," << W << ") updated fullres_hom with identity matrix]" << endl; 
+	}
+
+	return fullres_hom;
+}
+
   // Homography IP matching - Ricardo Monteiro - return ip matching
   //
   // This applies only the homography constraint. Not the best...
@@ -1298,32 +1394,41 @@ int main(int argc, char* argv[]) {
 		     image1.impl(), image2.impl(),
 		     ip_per_tile,
 		     nodata1, nodata2 );
+
     if ( matched_ip1.size() == 0 || matched_ip2.size() == 0 )
       return false;
     std::vector<Vector3> ransac_ip1 = iplist_to_vectorlist(matched_ip1),
-			 ransac_ip2 = iplist_to_vectorlist(matched_ip2);
+			 			 ransac_ip2 = iplist_to_vectorlist(matched_ip2);
     std::vector<size_t> indices;
     try {
       typedef math::RandomSampleConsensus<math::HomographyFittingFunctor, math::InterestPointErrorMetric> RansacT;
       const int    MIN_NUM_OUTPUT_INLIERS = ransac_ip1.size()/2;
-      const int    NUM_ITERATIONS         = 100;
+     //const int    MIN_NUM_OUTPUT_INLIERS = ransac_ip1.size()/10;
+	 // const int    MIN_NUM_OUTPUT_INLIERS = 4;
+      const int    NUM_ITERATIONS         = 200;
       RansacT ransac( math::HomographyFittingFunctor(),
 		      math::InterestPointErrorMetric(), NUM_ITERATIONS,
 		      inlier_threshold,
 		      MIN_NUM_OUTPUT_INLIERS, true
 		      );
+      
       Matrix<double> H(ransac(ransac_ip2,ransac_ip1)); // 2 then 1 is used here for legacy reasons
       //vw_out() << "\t--> Homography: " << H << "\n";
+      cout << "homography_ip_matching " << H << " ";
       indices = ransac.inlier_indices(H,ransac_ip2,ransac_ip1);
+      cout << H << endl;
     } catch (const math::RANSACErr& e ) {
       //vw_out() << "RANSAC Failed: " << e.what() << "\n";
       return false;
     }
 
    // std::vector<ip::InterestPoint> final_ip1, final_ip2;
+int i = 0; // DEBUG
     BOOST_FOREACH( size_t& index, indices ) {
       final_ip1.push_back(matched_ip1[index]);
       final_ip2.push_back(matched_ip2[index]);
+//cout << " after ip matching  " << final_ip2[i].y << " " << final_ip2[i].x << "]" << endl; // DEBUG
+i++;  // DEBUG
     }
 
 
@@ -1334,7 +1439,7 @@ int main(int argc, char* argv[]) {
     //                  final_ip1, final_ip2);
 
     //vw_out() << "\t    * Writing match file: " << output_name << "\n";
-    //ip::write_binary_match_file(output_name, final_ip1, final_ip2);
+    ip::write_binary_match_file(output_name, final_ip1, final_ip2);
     return true;
   }
 
@@ -1346,52 +1451,41 @@ Vector2i
 			    std::vector<ip::InterestPoint> const& right_ip,
 			    vw::Matrix<double>& left_matrix,
 			    vw::Matrix<double>& right_matrix,
-			    double threshRANSAC ) {
+			    double threshRANSAC,
+			    double minAvgDeltaY, BBox2i bbox ) {
     // Reformat the interest points for RANSAC
     std::vector<Vector3>  right_copy = iplist_to_vectorlist(right_ip),
 			  left_copy  = iplist_to_vectorlist(left_ip);
 
-    double thresh_factor = stereo_settings().ip_inlier_factor; // 1/15 by default
+    //double thresh_factor = stereo_settings().ip_inlier_factor; // 1/15 by default
     
     // Use RANSAC to determine a good homography transform between the images
     math::RandomSampleConsensus<math::HomographyFittingFunctor, math::InterestPointErrorMetric>
       ransac( math::HomographyFittingFunctor(),
 	      math::InterestPointErrorMetric(),
 	      100, // num iter
-              threshRANSAC * norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor), // inlier thresh 
-	      //norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor) > 1 ? threshRANSAC : (norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor)),
-	      //threshRANSAC, // Ricardo Monteiro //////////
-	      left_copy.size()*2/3 // min output inliers
-	      //left_copy.size()*1/10 // Ricardo Monteiro //////
+              //threshRANSAC * norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor), // inlier thresh 
+	      threshRANSAC, // Ricardo Monteiro //////////
+	      left_copy.size()*1/10 // min output inliers
 	      );
 
-    std::cout << "[RANSAC old thresh = " << norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor) << "]\n";
-    std::cout << "[RANSAC new thresh = " << threshRANSAC << "]\n";
-
+  //  std::cout << "[RANSAC old thresh = " << norm_2(Vector2(left_size.x(),left_size.y())) * (1.5*thresh_factor) << "]\n";
+  //  std::cout << "[RANSAC new thresh = " << threshRANSAC << "]\n";
+	
     Matrix<double> H = ransac(right_copy, left_copy);
+    cout << "homography_rectification " << H << " ";
     std::vector<size_t> indices = ransac.inlier_indices(H, right_copy, left_copy);
+    cout << H;
 
-    if(check_homography_matrix(H, left_copy, right_copy, indices)){
+    if(check_homography_matrix(H, left_copy, right_copy, indices, minAvgDeltaY, bbox)){
     // Set right to a homography that has been refined just to our inliers
     	left_matrix  = math::identity_matrix<3>();
-    	right_matrix = math::HomographyFittingFunctor()(right_copy, left_copy, H); 
+    	right_matrix = math::HomographyFittingFunctor()(right_copy, left_copy, H);
+    cout << H << endl;;
     }else{
 	left_matrix  = math::identity_matrix<3>();
-    	right_matrix = math::identity_matrix<3>();;
+    	right_matrix = math::identity_matrix<3>();
     }
-
-// Ricardo Monteiro // calculate average deltat Y after piecewise alignment
-    std::vector<ip::InterestPoint> left_points, right_points;
-    int j = 0;
-    for( size_t i = 0; i < left_ip.size(); i++ ){
-	if(i == indices[j]){
-	    left_points.push_back(left_ip[i]);
-	    right_points.push_back(right_ip[i]);
-	    j++;
-	}
-    }
-    double averageDeltaY = calcAverageDeltaY(left_points, right_points);
-    cout << "[" << averageDeltaY << " averageDeltaY after piecewise alignment]" << endl;
 
     // Work out the ideal render size
     BBox2i output_bbox, right_bbox;
@@ -1434,25 +1528,64 @@ Vector2i
 bool check_homography_matrix(Matrix<double>       const& H,
 			       std::vector<Vector3> const& left_points,
 			       std::vector<Vector3> const& right_points,
-			       std::vector<size_t>  const& indices
+			       std::vector<size_t>  const& indices,
+			       double minAvgDeltaY, BBox2i bbox
 			       ){
 
     // Sanity checks. If these fail, most likely the two images are too different
     // for stereo to succeed.
-    if ( indices.size() < std::min( right_points.size(), left_points.size() )/2 ){
+    /*if ( indices.size() < std::min( right_points.size(), left_points.size() )/2 ){
       vw_out(WarningMessage) << "InterestPointMatching: The number of inliers is less "
                              << "than 1/2 of the number of points. The inputs may be invalid.\n";
 	return false;
-    }
+    }*/
 
     double det = fabs(H(0, 0)*H(1, 1) - H(0, 1)*H(1, 0));
-    if (det <= 0.5 || det >= 2.0){ // Ricardo Monteiro // Original values 0.1 and 10
+    if (det <= 0.1 || det >= 10.0){
       vw_out(WarningMessage) << "InterestPointMatching: The determinant of the 2x2 submatrix "
                              << "of the homography matrix " << H << " is " << det
                              << ". There could be a large scale discrepancy among the input images "
                              << "or the inputs may be an invalid stereo pair.\n";
 	return false;
     }
+
+    // check if the avgDeltaY after piecewise alignment is better than the minAvgDeltaY
+    std::vector<Vector3> right_ip; 
+    std::vector<Vector3> left_ip;
+	std::vector<ip::InterestPoint> r_ip, l_ip;
+	ip::InterestPoint aux_r_ip, aux_l_ip;
+    double avgDeltaY = -1;
+    int ts = ASPGlobalOptions::corr_tile_size();
+    for(size_t i = 0; i < right_points.size(); i++)
+    { 
+		//cout << " ip matchings " << right_points[i].y() << " " << right_points[i].x() << "]" << endl; // DEBUG
+        right_ip.push_back(H * Vector3(right_points[i].x(), right_points[i].y(), 1));
+        left_ip.push_back(Vector3(left_points[i].x(), left_points[i].y(), 1));
+	// Normalize the coordinates, but don't divide by 0
+        if (right_ip[i].z() == 0 || left_ip[i].z() == 0) 
+            continue;
+        right_ip[i] /= right_ip[i].z();
+        left_ip[i] /= left_ip[i].z();
+
+		aux_l_ip.x = left_ip[i].x() - bbox.min().x(); // DEBUG
+    	aux_l_ip.y = left_ip[i].y() - bbox.min().y(); // DEBUG
+    	aux_r_ip.x = right_ip[i].x() - bbox.min().x(); // DEBUG
+    	aux_r_ip.y = right_ip[i].y() - bbox.min().y(); // DEBUG
+		r_ip.push_back(aux_r_ip); // DEBUG
+		l_ip.push_back(aux_l_ip); // DEBUG
+		//cout << " ip matchings after H " << right_ip[i].y() << " " << right_ip[i].x() << "]" << endl; // DEBUG
+    }
+    avgDeltaY = calcAverageDeltaY(left_ip, right_ip);
+    cout << "[tile(" << bbox.min().y()/ts << "," << bbox.min().x()/ts << ") avgDeltaY after piecewise alignment = " << avgDeltaY << "]" << endl;
+    
+	char outputName[30]; // DEBUG
+	int X = bbox.min().x()/ASPGlobalOptions::corr_tile_size(); // DEBUG
+	int Y = bbox.min().y()/ASPGlobalOptions::corr_tile_size(); // DEBUG
+	sprintf(outputName, "matches_after_H_%d_%d", Y, X); // DEBUG
+	ip::write_binary_match_file(outputName, l_ip, r_ip); // DEBUG
+    if(avgDeltaY == -1 || avgDeltaY >= minAvgDeltaY)
+        return false;
+
     return true;
 
   }
@@ -1462,13 +1595,23 @@ double calcAverageDeltaY(std::vector<ip::InterestPoint> const& left_points, std:
     double accuDiff = 0;
 
     if(left_points.size()){
-        for ( size_t i = 0; i < left_points.size(); i++ ) {
+        for ( size_t i = 0; i < left_points.size(); i++ )
 	    accuDiff += abs(left_points[i].y - right_points[i].y);
-        }
         return accuDiff/left_points.size(); // average
-    }else{
+    }else
 	return -1; // not valid
-    }
+}
+
+double calcAverageDeltaY(std::vector<Vector3> const& left_points, std::vector<Vector3> const& right_points)
+{
+    double accuDiff = 0;
+
+    if(left_points.size()){
+        for ( size_t i = 0; i < left_points.size(); i++ )
+	    accuDiff += abs(left_points[i].y() - right_points[i].y());
+        return accuDiff/left_points.size(); // average
+    }else
+	return -1; // not valid
 }
 
 

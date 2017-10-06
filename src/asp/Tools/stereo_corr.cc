@@ -34,6 +34,13 @@
 #include <asp/Core/InterestPointMatching.h>
 #include <vw/Stereo/StereoModel.h>
 
+#include <asp/Core/AffineEpipolar.cc>
+#include <asp/Core/AffineEpipolar.h>
+#include <vw/Math/Vector.h>
+#include <vw/Math/Matrix.h>
+#include <vw/Math/LinearAlgebra.h>
+#include <vw/InterestPoint/InterestData.h>
+
 using namespace vw;
 using namespace vw::stereo;
 using namespace asp;
@@ -54,6 +61,13 @@ using namespace std;
 			       std::vector<ip::InterestPoint>& final_ip1 = NULL,
  			       std::vector<ip::InterestPoint>& final_ip2 = NULL );
 Vector2i
+  affine_epipolar_rectification1( Vector2i const& left_size,
+                                 Vector2i const& right_size,
+                                 std::vector<ip::InterestPoint> const& ip1,
+                                 std::vector<ip::InterestPoint> const& ip2,
+                                 Matrix<double>& left_matrix,
+                                 Matrix<double>& right_matrix );
+Vector2i
   homography_rectification1( bool adjust_left_image_size,
 			    Vector2i const& left_size,
 			    Vector2i const& right_size,
@@ -67,20 +81,36 @@ bool check_homography_matrix(Matrix<double>       const& H,
 			       std::vector<Vector3> const& right_points,
 			       std::vector<size_t>  const& indices,
 			       double minAvgDeltaY, BBox2i bbox);
+bool check_homography_matrix(	Matrix<double>       const& left_matrix,
+								Matrix<double>       const& right_matrix,
+			       				std::vector<Vector3> const& left_points,
+			       				std::vector<Vector3> const& right_points,
+			       				double minAvgDeltaY, 
+								BBox2i bbox);
 double calcAverageDeltaY(std::vector<ip::InterestPoint> const& left_points, std::vector<ip::InterestPoint> const& right_points);
 double calcAverageDeltaY(std::vector<Vector3> const& left_points, std::vector<Vector3> const& right_points);
-
+BBox2f calcSearchRange(std::vector<ip::InterestPoint> const& left_ip, std::vector<ip::InterestPoint> const& right_ip, Matrix<double> const& left_matrix, Matrix<double> const& right_matrix, double multi);
 vw::Matrix<double> piecewiseAlignment(ImageView<float> left_image, 
-			ImageView<float> right_image,
-			ImageView<float> tile_left_image,
-			ImageView<float> tile_right_image,	
-			BBox2i bbox);
+									ImageView<float> right_image,
+									ImageView<float> tile_left_image,
+									ImageView<float> tile_right_image,	
+									BBox2i bbox);
 
 vw::Matrix<double> piecewiseAlignment_homography(ImageView<float> left_image, 
-			ImageView<float> right_image,
-			ImageView<float> tile_left_image,
-			ImageView<float> tile_right_image,	
-			BBox2i bbox);
+												ImageView<float> right_image,
+												ImageView<float> tile_left_image,
+												ImageView<float> tile_right_image,	
+												BBox2i bbox);
+BBox2f piecewiseAlignment_affineepipolar(	ImageView<float> left_image, 
+										ImageView<float> right_image,
+										ImageView<float> tile_left_image,
+										ImageView<float> tile_right_image,	
+										BBox2i bbox,
+										Vector2i& left_size,
+										Vector2i& right_size,
+										vw::Matrix<double>& left_matrix,
+										vw::Matrix<double>& right_matrix,
+										BBox2f local_search_range);
 
 /// Returns the properly cast cost mode type
 stereo::CostFunctionType get_cost_mode_value() {
@@ -833,6 +863,22 @@ cout << "start of tile " << bbox << endl;
     Matrix<double> fullres_hom = math::identity_matrix<3>();
     ImageViewRef<InputPixelType> right_trans_img;
     ImageViewRef<vw::uint8     > right_trans_mask;
+// piecewise alignment - Ricardo Monteiro
+    ImageViewRef<InputPixelType> left_trans_img;
+    ImageViewRef<vw::uint8     > left_trans_mask;
+	//int margin = 50;
+	//BBox2i newBBox = bbox.expand(margin);
+	ImageView<PixelGray<float> > tile_right_image = crop(m_right_image.impl(), bbox);
+	ImageView<PixelGray<float> > tile_left_image = crop(m_left_image.impl(), bbox);
+	ImageView<vw::uint8> tile_right_image_mask = crop(m_right_mask.impl(), bbox);
+	ImageView<vw::uint8> tile_left_image_mask = crop(m_left_mask.impl(), bbox);
+	Matrix<double>  align_left_matrix  = math::identity_matrix<3>(),
+                   	align_right_matrix = math::identity_matrix<3>();
+	char outputName[30];
+	int ts = ASPGlobalOptions::corr_tile_size();
+	int W = bbox.min().x()/ts;
+	int H = bbox.min().y()/ts;
+	cartography::GdalWriteOptions geo_opt;
 
     bool do_round = true; // round integer disparities after transform
 
@@ -894,48 +940,55 @@ cout << "start of tile " << bbox << endl;
         Vector3 dnscale( 1.0/m_upscale_factor[0], 1.0/m_upscale_factor[1], 1 );
         fullres_hom = diagonal_matrix(upscale)*lowres_hom*diagonal_matrix(dnscale);
 ////////// Ricardo Monteiro - code to overwrite fullres_hom
-	local_search_range = stereo::get_disparity_range( disparity_in_box );
-	cartography::GdalWriteOptions geo_opt;
-	char outputName[30];
-	int ts = ASPGlobalOptions::corr_tile_size();
-	int W = bbox.min().x()/ts;
-	int H = bbox.min().y()/ts;
-	ImageView<float> tile_right_image = crop(m_right_image.impl(), bbox);
-	ImageView<float> tile_left_image = crop(m_left_image.impl(), bbox);
-	sprintf(outputName, "tile_R_%d_%d.tif", H, W);
-	block_write_gdal_image(outputName, tile_right_image, geo_opt);
-	sprintf(outputName, "tile_L_%d_%d.tif", H, W);
-	block_write_gdal_image(outputName, tile_left_image, geo_opt);
-	//fullres_hom = piecewiseAlignment(m_left_image.impl(), m_right_image.impl(), tile_left_image, tile_right_image, bbox);
-	fullres_hom = piecewiseAlignment_homography(m_left_image.impl(), m_right_image.impl(), tile_left_image.impl(), tile_right_image.impl(), bbox);
-
-	m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts) = fullres_hom;
-	cout << "[tile(" << H << "," << W << " local_search_range = " << local_search_range << endl;
-	//local_search_range = stereo::get_disparity_range
-    //      (transform_disparities(do_round, seed_bbox,
-	//		     fullres_hom, disparity_in_box)); 
-	cout << "[tile(" <<  H << "," << W << " local_search_range (after H) = " << local_search_range << endl;
-	if(fullres_hom != math::identity_matrix<3>())
-		local_search_range.expand(5);
-	cout << "[tile(" <<  H << "," << W << " local_search_range (after H and adding 5) = " << local_search_range << endl;
-	cout << "[tile(" << H << "," << W << ") " << fullres_hom << "]" << endl;
+		local_search_range = stereo::get_disparity_range( disparity_in_box );		
+		sprintf(outputName, "tile_R_%d_%d.tif", H, W);
+		block_write_gdal_image(outputName, tile_right_image, geo_opt);
+		sprintf(outputName, "tile_L_%d_%d.tif", H, W);
+		block_write_gdal_image(outputName, tile_left_image, geo_opt);
+		Vector2i left_size = bbox.size();
+ 		Vector2i right_size = bbox.size();
+		cout << "[tile(" << H << "," << W << " left_size = " << left_size << endl;
+		cout << "[tile(" << H << "," << W << " right_size = " << right_size << endl;
+	    local_search_range = piecewiseAlignment_affineepipolar(m_left_image.impl(), m_right_image.impl(), tile_left_image.impl(), tile_right_image.impl(), bbox, left_size, right_size, align_left_matrix, align_right_matrix, local_search_range);
+		cout << "[tile(" << H << "," << W << " local_search_range after piecewise alignment = " << local_search_range << endl;
+		right_size = left_size;
+		cout << "[tile(" << H << "," << W << " left_size after piecewise alignment = " << left_size << endl;
+		cout << "[tile(" << H << "," << W << " right_size after piecewise alignment = " << right_size << endl;
+		fullres_hom = align_right_matrix;
+		m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts) = fullres_hom;
+		cout << "[tile(" << H << "," << W << " local_search_range = " << local_search_range << endl;
+		
+		cout << "[tile(" << H << "," << W << ") " << fullres_hom << "]" << endl;
+		cout << "[tile(" << H << "," << W << ") " << align_left_matrix << "]" << endl;
+		ImageViewRef< PixelMask<InputPixelType> >
+          left_trans_masked_img
+          //= transform (copy_mask( m_left_image.impl(),
+			//          create_mask(m_left_mask.impl()) ),
+			= transform (copy_mask( tile_left_image.impl(),
+						create_mask(tile_left_image_mask.impl()) ),
+	               HomographyTransform(align_left_matrix),
+	              // m_left_image.impl().cols(), m_left_image.impl().rows());
+					left_size.x(), left_size.y()); 
+        left_trans_img  = apply_mask(left_trans_masked_img);
+        left_trans_mask = channel_cast_rescale<uint8>(select_channel(left_trans_masked_img, 1));
 /////
         ImageViewRef< PixelMask<InputPixelType> >
           right_trans_masked_img
-          = transform (copy_mask( m_right_image.impl(),
-			          create_mask(m_right_mask.impl()) ),
+          //= transform (copy_mask( m_right_image.impl(),
+		//	          create_mask(m_right_mask.impl()) ),
+		  = transform (copy_mask(tile_right_image.impl(),
+					 create_mask(tile_right_image_mask.impl()) ),
 	               HomographyTransform(fullres_hom),
-	               m_left_image.impl().cols(), m_left_image.impl().rows());
+	               //m_left_image.impl().cols(), m_left_image.impl().rows());
+					right_size.x(), right_size.y()); 
         right_trans_img  = apply_mask(right_trans_masked_img);
         right_trans_mask = channel_cast_rescale<uint8>(select_channel(right_trans_masked_img, 1));
 
 //// write ind tiles
-	ImageView<float> tile_right_trans_img = crop(right_trans_img.impl(), bbox); // because crop is called with an imageview variable, the right trans img is actually tranformed when ASP is reading the image
-	ImageView<float> tile_left_trans_img = crop(m_left_image.impl(), bbox);
 	sprintf(outputName, "piecewiseHomography_R_%d_%d.tif", H, W);
-	block_write_gdal_image(outputName, tile_right_trans_img, geo_opt);
+	block_write_gdal_image(outputName, right_trans_img, geo_opt);
 	sprintf(outputName, "piecewiseHomography_L_%d_%d.tif", H, W);
-	block_write_gdal_image(outputName, tile_left_trans_img, geo_opt);
+	block_write_gdal_image(outputName, left_trans_img, geo_opt);
 /////
 
       } //endif use_local_homography
@@ -973,10 +1026,14 @@ cout << "start of tile " << bbox << endl;
     // Now we are ready to actually perform correlation
     const int rm_half_kernel = 5; // Filter kernel size used by CorrelationView
     if (use_local_homography){
-      typedef vw::stereo::PyramidCorrelationView<ImageType, ImageViewRef<InputPixelType>, 
-                                                 MaskType,  ImageViewRef<vw::uint8     > > CorrView;
-      CorrView corr_view( m_left_image,   right_trans_img,
-                          m_left_mask,    right_trans_mask,
+      //typedef vw::stereo::PyramidCorrelationView<ImageType, ImageViewRef<InputPixelType>, 
+      //                                           MaskType,  ImageViewRef<vw::uint8     > > CorrView;
+    //  CorrView corr_view( m_left_image,   right_trans_img,
+    //                      m_left_mask,    right_trans_mask,
+		typedef vw::stereo::PyramidCorrelationView<ImageViewRef<InputPixelType>, ImageViewRef<InputPixelType>, 
+                                                   ImageViewRef<vw::uint8     >, ImageViewRef<vw::uint8     > > CorrView;
+	  CorrView corr_view( left_trans_img,   right_trans_img,
+                          left_trans_mask,    right_trans_mask,
                           static_cast<vw::stereo::PrefilterModeType>(stereo_settings().pre_filter_mode),
                           stereo_settings().slogW,
                           local_search_range,
@@ -992,7 +1049,48 @@ cout << "start of tile " << bbox << endl;
                           stereo_settings().corr_blob_filter_area,
                           stereo_settings().stereo_debug );
       cout << "end of tile " << bbox << endl;
-      return corr_view.prerasterize(bbox);
+      //return corr_view.prerasterize(bbox);
+      ImageView<pixel_type> stereo_result = corr_view.prerasterize(bounding_box(left_trans_img));
+      ImageView<pixel_type> stereo_result_inv;
+      ImageView<vw::uint8     > stereo_result_mask_inv;  
+	  ImageView<vw::uint8     > stereo_result_mask = left_trans_mask;
+	  // write stereo result
+	  sprintf(outputName, "stereo_%d_%d.tif", H, W);
+	  block_write_gdal_image(outputName, stereo_result, geo_opt);
+	  
+		ImageView< PixelMask<pixel_type> >
+          stereo_result_masked_img_inv
+			= transform (copy_mask(stereo_result.impl(), stereo_result_mask.impl()),
+	               HomographyTransform(inverse(align_left_matrix)),
+					tile_left_image.cols(), tile_left_image.rows()); 
+        stereo_result_inv  = apply_mask(stereo_result_masked_img_inv);
+        stereo_result_mask_inv = channel_cast_rescale<uint8>(select_channel(stereo_result_masked_img_inv, 2));
+	sprintf(outputName, "stereoINV_%d_%d.tif", H, W);
+	ImageView<pixel_type> image(bbox.width(), bbox.height());	
+	block_write_gdal_image(outputName, stereo_result_inv, geo_opt);  
+
+	ImageView<pixel_type> stereo_result_corrected(bbox.width(), bbox.height());
+	for(int j=0; j<bbox.rows(); j++ ){
+		for(int i=0; i<bbox.cols(); i++ ){
+// subtract offset
+			Vector2 pixel_L_prime = HomographyTransform(align_left_matrix).forward(Vector2(i,j));
+			//cout << "pixel_L_prime = " << pixel_L_prime << endl;
+			float dx = stereo_result_inv(i,j)[0];
+			float dy = stereo_result_inv(i,j)[1];
+			Vector2 pixel_R_prime = pixel_L_prime + Vector2(dx,dy);
+			//cout << "pixel_R_prime = " << pixel_R_prime << endl;
+			Vector2 new_disp = pixel_R_prime - Vector2(i,j);
+			//cout << "new_disp = " << new_disp << endl;
+			stereo_result_corrected(i,j)[0] = new_disp.x();
+			stereo_result_corrected(i,j)[1] = new_disp.y();
+			if(stereo_result_mask_inv(i,j))
+				validate(stereo_result_corrected(i,j));
+				//stereo_result_corrected(i,j)[2] = 2147483647;
+		}
+	}
+
+	  //return prerasterize_type(image,-bbox.min().x(),-bbox.min().y(),cols(),rows() );
+	return prerasterize_type(stereo_result_corrected,-bbox.min().x(),-bbox.min().y(),cols(),rows() );
     }else{
       typedef vw::stereo::PyramidCorrelationView<ImageType, ImageType, MaskType, MaskType > CorrView;
       CorrView corr_view( m_left_image,   m_right_image,
@@ -1219,6 +1317,78 @@ int main(int argc, char* argv[]) {
 }
 
 ////// Ricardo Monteiro
+BBox2f piecewiseAlignment_affineepipolar(	ImageView<float> left_image, 
+										ImageView<float> right_image,
+										ImageView<float> tile_left_image,
+										ImageView<float> tile_right_image,	
+										BBox2i bbox,
+										Vector2i& left_size,
+										Vector2i& right_size,
+										vw::Matrix<double>& left_matrix,
+										vw::Matrix<double>& right_matrix,
+										BBox2f local_search_range)
+{
+	using namespace vw;
+
+	double threshPiecewiseAlignment = 3;
+	double avgDeltaY = -1.0;
+	double threshRANSAC = 20.0;
+	double threshSearchRange = 2;
+
+	Matrix<double> H;
+	double left_nodata_value  = numeric_limits<double>::quiet_NaN();
+  	double right_nodata_value = numeric_limits<double>::quiet_NaN();
+    std::vector<ip::InterestPoint> matched_ip1, matched_ip2;
+	std::vector<ip::InterestPoint> matchedRANSAC_ip1,matchedRANSAC_ip2;
+	std::vector<ip::InterestPoint> matchedRANSAC_final_ip1, matchedRANSAC_final_ip2;
+	ip::InterestPoint aux_r_ip, aux_l_ip;
+	bool success = false;
+	char outputName[30]; // DEBUG
+	int X = bbox.min().x()/ASPGlobalOptions::corr_tile_size();
+	int Y = bbox.min().y()/ASPGlobalOptions::corr_tile_size();
+	// detect and match ips
+	sprintf(outputName, "matches_%d_%d", Y, X); // DEBUG
+    try { success = homography_ip_matching1( tile_left_image, tile_right_image,
+                                          stereo_settings().ip_per_tile,
+                                          outputName, threshRANSAC, // before it was inlier_threshold
+                                          left_nodata_value, right_nodata_value,
+					  						matchedRANSAC_ip1, matchedRANSAC_ip2); }catch(...){}
+	avgDeltaY = calcAverageDeltaY(matchedRANSAC_ip1, matchedRANSAC_ip2); // estimate global alignment
+	cout << "[tile(" << Y << "," << X << ") avgDeltaY after global alignment = " << avgDeltaY << "]" << endl; // DEBUG
+	if(avgDeltaY != -1 || avgDeltaY >= threshPiecewiseAlignment){ // if the alignment can be improved
+		for ( size_t i = 0; i < matchedRANSAC_ip1.size(); i++ ) { // adjust ip matches to tile
+				//cout << "[tile(" << Y << "," << X << " matchedRANSAC " << matchedRANSAC_ip2[i].y << " " << matchedRANSAC_ip2[i].x << "]" << endl; // DEBUG
+	    	    //matchedRANSAC_ip1[i].x += bbox.min().x();
+	    	    //matchedRANSAC_ip1[i].y += bbox.min().y();
+	    	    //matchedRANSAC_ip2[i].x += bbox.min().x();
+	    	    //matchedRANSAC_ip2[i].y += bbox.min().y();
+		}
+		sprintf(outputName, "matches_adj_%d_%d", Y, X); // DEBUG
+		ip::write_binary_match_file(outputName, matchedRANSAC_ip1, matchedRANSAC_ip2); // DEBUG
+		cout << "[tile(" << Y << "," << X << ")" << matchedRANSAC_ip1.size() << " matching points]" << endl;
+		std::vector<Vector3> ransac_ip1 = iplist_to_vectorlist(matchedRANSAC_ip1), ransac_ip2 = iplist_to_vectorlist(matchedRANSAC_ip2);
+		// RANSAC
+		try {	
+			left_size = affine_epipolar_rectification1(	left_size, right_size, matchedRANSAC_ip1, 												matchedRANSAC_ip2, left_matrix, right_matrix );
+		} catch ( ... ) {
+		  	left_matrix = math::identity_matrix<3>();
+			right_matrix = math::identity_matrix<3>();
+			return local_search_range;
+		}
+		// check left_matrix and right_matrix
+		if(!check_homography_matrix(left_matrix, right_matrix, ransac_ip1, ransac_ip2, avgDeltaY, bbox)){
+			left_matrix = math::identity_matrix<3>();
+			right_matrix = math::identity_matrix<3>();
+			return local_search_range;
+		}
+	}else{ // if the alignment cannot be improved
+		left_matrix = math::identity_matrix<3>();
+		right_matrix = math::identity_matrix<3>();
+		return local_search_range;
+	}
+	return calcSearchRange(matchedRANSAC_ip1, matchedRANSAC_ip2, left_matrix, right_matrix, threshSearchRange);
+}
+
 vw::Matrix<double> piecewiseAlignment_homography(ImageView<float> left_image, 
 			ImageView<float> right_image,
 			ImageView<float> tile_left_image,
@@ -1229,7 +1399,7 @@ vw::Matrix<double> piecewiseAlignment_homography(ImageView<float> left_image,
 
 	double threshPiecewiseAlignment = 3.0;
 	double avgDeltaY = -1.0;
-	double threshRANSAC = 1.0;
+	double threshRANSAC = 3.0;
 
 	Matrix<double> H;
 	double left_nodata_value  = numeric_limits<double>::quiet_NaN();
@@ -1373,6 +1543,66 @@ vw::Matrix<double> piecewiseAlignment(ImageView<float> left_image,
 	return fullres_hom;
 }
 
+Vector2i
+  affine_epipolar_rectification1( Vector2i const& left_size,
+                                 Vector2i const& right_size,
+                                 std::vector<ip::InterestPoint> const& ip1,
+                                 std::vector<ip::InterestPoint> const& ip2,
+                                 Matrix<double>& left_matrix,
+                                 Matrix<double>& right_matrix ) {
+    // Create affine fundamental matrix
+    Matrix<double> fund = linear_affine_fundamental_matrix( ip1, ip2 );
+
+    // Solve for rotation matrices
+    double Hl = sqrt( fund(2,0)*fund(2,0) + fund(2,1)*fund(2,1) );
+    double Hr = sqrt( fund(0,2)*fund(0,2) + fund(1,2)*fund(1,2) );
+    Vector2 epipole(-fund(2,1),fund(2,0)), epipole_prime(-fund(1,2),fund(0,2));
+    if ( epipole.x() < 0 )
+      epipole = -epipole;
+    if ( epipole_prime.x() < 0 )
+      epipole_prime = -epipole_prime;
+    epipole.y() = -epipole.y();
+    epipole_prime.y() = -epipole_prime.y();
+
+    left_matrix = math::identity_matrix<3>();
+    right_matrix = math::identity_matrix<3>();
+    left_matrix(0,0) = epipole[0]/Hl;
+    left_matrix(0,1) = -epipole[1]/Hl;
+    left_matrix(1,0) = epipole[1]/Hl;
+    left_matrix(1,1) = epipole[0]/Hl;
+    right_matrix(0,0) = epipole_prime[0]/Hr;
+    right_matrix(0,1) = -epipole_prime[1]/Hr;
+    right_matrix(1,0) = epipole_prime[1]/Hr;
+    right_matrix(1,1) = epipole_prime[0]/Hr;
+
+    // Solve for ideal scaling and translation
+    solve_y_scaling( ip1, ip2, left_matrix, right_matrix );
+
+    // Solve for ideal shear, scale, and translation of X axis
+    solve_x_shear( ip1, ip2, left_matrix, right_matrix );
+
+    // Work out the ideal render size.
+    BBox2i output_bbox, right_bbox;
+    output_bbox.grow( subvector(left_matrix*Vector3(0,0,1),0,2) );
+    output_bbox.grow( subvector(left_matrix*Vector3(left_size.x(),0,1),0,2) );
+    output_bbox.grow( subvector(left_matrix*Vector3(left_size.x(),left_size.y(),1),0,2) );
+    output_bbox.grow( subvector(left_matrix*Vector3(0,left_size.y(),1),0,2) );
+    right_bbox.grow( subvector(right_matrix*Vector3(0,0,1),0,2) );
+    right_bbox.grow( subvector(right_matrix*Vector3(right_size.x(),0,1),0,2) );
+    right_bbox.grow( subvector(right_matrix*Vector3(right_size.x(),right_size.y(),1),0,2) );
+    right_bbox.grow( subvector(right_matrix*Vector3(0,right_size.y(),1),0,2) );
+    output_bbox.crop( right_bbox );
+
+    left_matrix(0,2) -= output_bbox.min().x();
+    right_matrix(0,2) -= output_bbox.min().x();
+    left_matrix(1,2) -= output_bbox.min().y();
+    right_matrix(1,2) -= output_bbox.min().y();
+
+    return Vector2i( output_bbox.width(), output_bbox.height() );
+  }
+
+
+
   // Homography IP matching - Ricardo Monteiro - return ip matching
   //
   // This applies only the homography constraint. Not the best...
@@ -1394,7 +1624,7 @@ vw::Matrix<double> piecewiseAlignment(ImageView<float> left_image,
 		     image1.impl(), image2.impl(),
 		     ip_per_tile,
 		     nodata1, nodata2 );
-
+    cout << "matches left = " <<  matched_ip1.size() << " matches right = " <<  matched_ip2.size() << endl;
     if ( matched_ip1.size() == 0 || matched_ip2.size() == 0 )
       return false;
     std::vector<Vector3> ransac_ip1 = iplist_to_vectorlist(matched_ip1),
@@ -1405,7 +1635,7 @@ vw::Matrix<double> piecewiseAlignment(ImageView<float> left_image,
       const int    MIN_NUM_OUTPUT_INLIERS = ransac_ip1.size()/2;
      //const int    MIN_NUM_OUTPUT_INLIERS = ransac_ip1.size()/10;
 	 // const int    MIN_NUM_OUTPUT_INLIERS = 4;
-      const int    NUM_ITERATIONS         = 200;
+      const int    NUM_ITERATIONS         = 100;
       RansacT ransac( math::HomographyFittingFunctor(),
 		      math::InterestPointErrorMetric(), NUM_ITERATIONS,
 		      inlier_threshold,
@@ -1414,9 +1644,9 @@ vw::Matrix<double> piecewiseAlignment(ImageView<float> left_image,
       
       Matrix<double> H(ransac(ransac_ip2,ransac_ip1)); // 2 then 1 is used here for legacy reasons
       //vw_out() << "\t--> Homography: " << H << "\n";
-      cout << "homography_ip_matching " << H << " ";
+     // cout << "homography_ip_matching " << H << " ";
       indices = ransac.inlier_indices(H,ransac_ip2,ransac_ip1);
-      cout << H << endl;
+     // cout << H << endl;
     } catch (const math::RANSACErr& e ) {
       //vw_out() << "RANSAC Failed: " << e.what() << "\n";
       return false;
@@ -1525,6 +1755,81 @@ Vector2i
     return Vector2i( output_bbox.width(), output_bbox.height() );
   }
 
+
+bool check_homography_matrix(	Matrix<double>       const& left_matrix,
+								Matrix<double>       const& right_matrix,
+			       				std::vector<Vector3> const& left_points,
+			       				std::vector<Vector3> const& right_points,
+			       				double minAvgDeltaY, 
+								BBox2i bbox
+								){
+
+    // Sanity checks. If these fail, most likely the two images are too different
+    // for stereo to succeed.
+    /*if ( indices.size() < std::min( right_points.size(), left_points.size() )/2 ){
+      vw_out(WarningMessage) << "InterestPointMatching: The number of inliers is less "
+                             << "than 1/2 of the number of points. The inputs may be invalid.\n";
+	return false;
+    }*/
+
+    double det = fabs(left_matrix(0, 0)*left_matrix(1, 1) - left_matrix(0, 1)*left_matrix(1, 0));
+    if (det <= 0.1 || det >= 10.0){
+      vw_out(WarningMessage) << "InterestPointMatching: The determinant of the 2x2 submatrix "
+                             << "of the homography matrix " << left_matrix << " is " << det
+                             << ". There could be a large scale discrepancy among the input images "
+                             << "or the inputs may be an invalid stereo pair.\n";
+	return false;
+    }
+	det = fabs(right_matrix(0, 0)*right_matrix(1, 1) - right_matrix(0, 1)*right_matrix(1, 0));
+    if (det <= 0.1 || det >= 10.0){
+      vw_out(WarningMessage) << "InterestPointMatching: The determinant of the 2x2 submatrix "
+                             << "of the homography matrix " << right_matrix << " is " << det
+                             << ". There could be a large scale discrepancy among the input images "
+                             << "or the inputs may be an invalid stereo pair.\n";
+	return false;
+    }
+
+    // check if the avgDeltaY after piecewise alignment is better than the minAvgDeltaY
+    std::vector<Vector3> right_ip; 
+    std::vector<Vector3> left_ip;
+	std::vector<ip::InterestPoint> r_ip, l_ip;
+	ip::InterestPoint aux_r_ip, aux_l_ip;
+    double avgDeltaY = -1;
+    int ts = ASPGlobalOptions::corr_tile_size();
+    for(size_t i = 0; i < right_points.size(); i++)
+    { 
+		//cout << " ip matchings " << right_points[i].y() << " " << right_points[i].x() << "]" << endl; // DEBUG
+        right_ip.push_back(right_matrix * Vector3(right_points[i].x(), right_points[i].y(), 1));
+        left_ip.push_back(left_matrix * Vector3(left_points[i].x(), left_points[i].y(), 1));
+	// Normalize the coordinates, but don't divide by 0
+        if (right_ip[i].z() == 0 || left_ip[i].z() == 0) 
+            continue;
+        right_ip[i] /= right_ip[i].z();
+        left_ip[i] /= left_ip[i].z();
+
+		aux_l_ip.x = left_ip[i].x() /*- bbox.min().x()*/; // DEBUG
+    	aux_l_ip.y = left_ip[i].y() /*- bbox.min().y()*/; // DEBUG
+    	aux_r_ip.x = right_ip[i].x() /*- bbox.min().x()*/; // DEBUG
+    	aux_r_ip.y = right_ip[i].y() /*- bbox.min().y()*/; // DEBUG
+		r_ip.push_back(aux_r_ip); // DEBUG
+		l_ip.push_back(aux_l_ip); // DEBUG
+		//cout << " ip matchings after H " << right_ip[i].y() << " " << right_ip[i].x() << "]" << endl; // DEBUG
+    }
+    avgDeltaY = calcAverageDeltaY(left_ip, right_ip);
+    cout << "[tile(" << bbox.min().y()/ts << "," << bbox.min().x()/ts << ") avgDeltaY after piecewise alignment = " << avgDeltaY << "]" << endl;
+    
+	char outputName[30]; // DEBUG
+	int X = bbox.min().x()/ASPGlobalOptions::corr_tile_size(); // DEBUG
+	int Y = bbox.min().y()/ASPGlobalOptions::corr_tile_size(); // DEBUG
+	sprintf(outputName, "matches_after_H_%d_%d", Y, X); // DEBUG
+	ip::write_binary_match_file(outputName, l_ip, r_ip); // DEBUG
+    if(avgDeltaY == -1 || avgDeltaY >= minAvgDeltaY)
+        return false;
+
+    return true;
+
+  }
+
 bool check_homography_matrix(Matrix<double>       const& H,
 			       std::vector<Vector3> const& left_points,
 			       std::vector<Vector3> const& right_points,
@@ -1614,4 +1919,36 @@ double calcAverageDeltaY(std::vector<Vector3> const& left_points, std::vector<Ve
 	return -1; // not valid
 }
 
+BBox2f calcSearchRange(std::vector<ip::InterestPoint> const& left_ip, std::vector<ip::InterestPoint> const& right_ip, Matrix<double> const& left_matrix, Matrix<double> const& right_matrix, double multi)
+{
+	std::vector<int> diffY, diffX;
+	int maxDiffY = 0, maxDiffX = 0, minDiffY = 0, minDiffX = 0; 
+	std::vector<Vector3> trans_left_points, trans_right_points;
+
+	for(size_t i = 0; i < left_ip.size(); i++) // transform ip matches
+    { 
+        trans_right_points.push_back(right_matrix * Vector3(right_ip[i].x, right_ip[i].y, 1));
+        trans_left_points.push_back(left_matrix * Vector3(left_ip[i].x, left_ip[i].y, 1));
+        if (trans_right_points[i].z() == 0 || trans_left_points[i].z() == 0) 
+            continue;
+        trans_right_points[i] /= trans_right_points[i].z();
+        trans_left_points[i] /= trans_left_points[i].z();
+    }
+
+	for ( size_t i = 0; i < trans_right_points.size(); i++ ){ // gen list of diff (right - left)
+		diffY.push_back(trans_right_points[i].y() - trans_left_points[i].y());
+		diffX.push_back(trans_right_points[i].x() - trans_left_points[i].x());
+	}
+	for ( size_t i = 0; i < trans_right_points.size(); i++ ){ // get min and max
+		if(diffY[i] < minDiffY)
+			minDiffY = diffY[i];
+		if(diffX[i] < minDiffX)
+			minDiffX = diffX[i];
+		if(diffY[i] > maxDiffY)
+			maxDiffY = diffY[i];
+		if(diffX[i] > maxDiffX)
+			maxDiffX = diffX[i];
+	}
+	return BBox2f(multi * minDiffX, multi * minDiffY, (multi * maxDiffX) - (multi * minDiffX), (multi * maxDiffY) - (multi * minDiffY));
+}
 

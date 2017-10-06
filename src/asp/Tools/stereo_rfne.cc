@@ -226,28 +226,52 @@ public:
     if (stereo_settings().seed_mode > 0 && stereo_settings().use_local_homography){
 
       int ts = ASPGlobalOptions::corr_tile_size();
-      Matrix<double>  lowres_hom = m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts);
-      Vector3 upscale( m_upscale_factor[0],     m_upscale_factor[1],     1 );
-      Vector3 dnscale( 1.0/m_upscale_factor[0], 1.0/m_upscale_factor[1], 1 );
-      Matrix<double>  fullres_hom = diagonal_matrix(upscale)*lowres_hom*diagonal_matrix(dnscale);
+    //  Matrix<double>  lowres_hom = m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts);
+     //  Vector3 upscale( m_upscale_factor[0],     m_upscale_factor[1],     1 );
+     // Vector3 dnscale( 1.0/m_upscale_factor[0], 1.0/m_upscale_factor[1], 1 );
+    //  Matrix<double>  fullres_hom = diagonal_matrix(upscale)*lowres_hom*diagonal_matrix(dnscale); RM
+	  Matrix<double>  fullres_hom = m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts);
+	  cout << " fullres_hom = " << fullres_hom << endl;
+	  cout << " bbox = " << bbox << endl;
+	  ImageView<PixelGray<float> > tile_right_image = crop(m_right_image.impl(), bbox);
+	  ImageView<vw::uint8> tile_right_image_mask = crop(m_right_mask.impl(), bbox);
 
       // Must transform the right image by the local disparity
       // to be in the same conditions as for stereo correlation.
       typedef typename Image2T::pixel_type right_pix_type;
       ImageViewRef< PixelMask<right_pix_type> > right_trans_masked_img
-        = transform (copy_mask( m_right_image.impl(), create_mask(m_right_mask) ),
+      //  = transform (copy_mask( m_right_image.impl(), create_mask(m_right_mask) ),
+      //               HomographyTransform(fullres_hom),
+      //               m_left_image.impl().cols(), m_left_image.impl().rows()); 
+		// apply transf to tile individually 
+        = transform (copy_mask( tile_right_image.impl(), create_mask(tile_right_image_mask) ),
                      HomographyTransform(fullres_hom),
-                     m_left_image.impl().cols(), m_left_image.impl().rows());
+                     tile_right_image.cols(), tile_right_image.rows());
       ImageViewRef<right_pix_type> right_trans_img = apply_mask(right_trans_masked_img);
-
 
       tile_disparity = crop(refine_disparity(m_left_image, right_trans_img,
                                              m_integer_disp, m_opt, verbose), bbox);
 
       // Must undo the local homography transform
-      bool do_round = false; // don't round floating point disparities
-      tile_disparity = transform_disparities(do_round, bbox, inverse(fullres_hom),
-                                             tile_disparity);
+      //bool do_round = false; // don't round floating point disparities
+     // tile_disparity = transform_disparities(do_round, bbox, inverse(fullres_hom),
+      //                                       tile_disparity);
+
+	  // overwrite tile_disparity by adjusting right tile and calculating the new disparity (unaligned L and unaligned R)
+
+	  for(int j=0; j<tile_right_image.rows(); j++ ){
+		for(int i=0; i<tile_right_image.cols(); i++ ){
+			Vector2 pixel_R = HomographyTransform(fullres_hom).forward(Vector2(i,j));
+			float dx = tile_disparity(i,j)[0];
+			float dy = tile_disparity(i,j)[1];
+			Vector2 pixel_L = pixel_R - Vector2(dx,dy);
+			Vector2 new_disp = Vector2(i,j) - pixel_L;
+			tile_disparity(i,j)[0] = new_disp.x();
+			tile_disparity(i,j)[1] = new_disp.y();
+			if(right_trans_masked_img(i,j))
+				validate(tile_disparity(i,j));
+		}
+	}
 
     }else{
       tile_disparity = crop(refine_disparity(m_left_image, m_right_image,

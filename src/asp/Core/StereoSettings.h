@@ -47,8 +47,10 @@ namespace asp {
     
     // Constants
     static int   corr_tile_size() { return 1024; } // Tile size for correlation
-    static int   rfne_tile_size() { return 256;  } // Tile size for refinement
+   // static int   rfne_tile_size() { return 256;  } // Tile size for refinement
     static int   tri_tile_size()  { return 256;  } // Tile size for tri/point cloud
+// RM
+	static int   rfne_tile_size() { return 1024;  } // Tile size for refinement
   };
 
   // Program Options for each executable/step

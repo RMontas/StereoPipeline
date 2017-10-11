@@ -864,21 +864,23 @@ cout << "start of tile " << bbox << endl;
     ImageViewRef<InputPixelType> right_trans_img;
     ImageViewRef<vw::uint8     > right_trans_mask;
 // piecewise alignment - Ricardo Monteiro
-    ImageViewRef<InputPixelType> left_trans_img;
-    ImageViewRef<vw::uint8     > left_trans_mask;
-	//int margin = 50;
-	//BBox2i newBBox = bbox.expand(margin);
-	ImageView<PixelGray<float> > tile_right_image = crop(m_right_image.impl(), bbox);
-	ImageView<PixelGray<float> > tile_left_image = crop(m_left_image.impl(), bbox);
-	ImageView<vw::uint8> tile_right_image_mask = crop(m_right_mask.impl(), bbox);
-	ImageView<vw::uint8> tile_left_image_mask = crop(m_left_mask.impl(), bbox);
-	Matrix<double>  align_left_matrix  = math::identity_matrix<3>(),
-                   	align_right_matrix = math::identity_matrix<3>();
 	char outputName[30];
 	int ts = ASPGlobalOptions::corr_tile_size();
 	int W = bbox.min().x()/ts;
 	int H = bbox.min().y()/ts;
 	cartography::GdalWriteOptions geo_opt;
+    ImageViewRef<InputPixelType> left_trans_img;
+    ImageViewRef<vw::uint8     > left_trans_mask;
+	int margin = 50;
+	BBox2i newBBox = BBox2i(bbox.min().x(), bbox.min().y(), bbox.max().x(), bbox.max().y());
+	newBBox.expand(margin);
+	newBBox.crop(bounding_box(m_left_image));
+	ImageView<PixelGray<float> > tile_right_image = crop(m_right_image.impl(), newBBox);
+	ImageView<PixelGray<float> > tile_left_image = crop(m_left_image.impl(), newBBox);
+	ImageView<vw::uint8> tile_right_image_mask = crop(m_right_mask.impl(), newBBox);
+	ImageView<vw::uint8> tile_left_image_mask = crop(m_left_mask.impl(), newBBox);
+	Matrix<double>  align_left_matrix  = math::identity_matrix<3>(),
+                   	align_right_matrix = math::identity_matrix<3>();
 
     bool do_round = true; // round integer disparities after transform
 
@@ -945,11 +947,11 @@ cout << "start of tile " << bbox << endl;
 		block_write_gdal_image(outputName, tile_right_image, geo_opt);
 		sprintf(outputName, "tile_L_%d_%d.tif", H, W);
 		block_write_gdal_image(outputName, tile_left_image, geo_opt);
-		Vector2i left_size = bbox.size();
- 		Vector2i right_size = bbox.size();
+		Vector2i left_size = newBBox.size();
+ 		Vector2i right_size = newBBox.size();
 		cout << "[tile(" << H << "," << W << " left_size = " << left_size << endl;
 		cout << "[tile(" << H << "," << W << " right_size = " << right_size << endl;
-	    local_search_range = piecewiseAlignment_affineepipolar(m_left_image.impl(), m_right_image.impl(), tile_left_image.impl(), tile_right_image.impl(), bbox, left_size, right_size, align_left_matrix, align_right_matrix, local_search_range);
+	    local_search_range = piecewiseAlignment_affineepipolar(m_left_image.impl(), m_right_image.impl(), tile_left_image.impl(), tile_right_image.impl(), newBBox, left_size, right_size, align_left_matrix, align_right_matrix, local_search_range);
 		cout << "[tile(" << H << "," << W << " local_search_range after piecewise alignment = " << local_search_range << endl;
 		right_size = left_size;
 		cout << "[tile(" << H << "," << W << " left_size after piecewise alignment = " << left_size << endl;
@@ -1048,7 +1050,7 @@ cout << "start of tile " << bbox << endl;
                           sgm_subpixel_mode, sgm_search_buffer, stereo_settings().corr_memory_limit_mb,
                           stereo_settings().corr_blob_filter_area,
                           stereo_settings().stereo_debug );
-      cout << "end of tile " << bbox << endl;
+      cout << "end of tile " << newBBox << endl;
       //return corr_view.prerasterize(bbox);
       ImageView<pixel_type> stereo_result = corr_view.prerasterize(bounding_box(left_trans_img));
       ImageView<pixel_type> stereo_result_inv;
@@ -1062,28 +1064,29 @@ cout << "start of tile " << bbox << endl;
           stereo_result_masked_img_inv
 			= transform (copy_mask(stereo_result.impl(), stereo_result_mask.impl()),
 	               HomographyTransform(inverse(align_left_matrix)),
-					tile_left_image.cols(), tile_left_image.rows()); 
+					//tile_left_image.cols(), tile_left_image.rows()); 
+					newBBox.width(), newBBox.height());
         stereo_result_inv  = apply_mask(stereo_result_masked_img_inv);
         stereo_result_mask_inv = channel_cast_rescale<uint8>(select_channel(stereo_result_masked_img_inv, 2));
 	sprintf(outputName, "stereoINV_%d_%d.tif", H, W);
-	ImageView<pixel_type> image(bbox.width(), bbox.height());	
+	//ImageView<pixel_type> image(newBBox.width(), newBBox.height());	
 	block_write_gdal_image(outputName, stereo_result_inv, geo_opt);  
 
 	ImageView<pixel_type> stereo_result_corrected(bbox.width(), bbox.height());
-	for(int j=0; j<bbox.rows(); j++ ){
-		for(int i=0; i<bbox.cols(); i++ ){
-// subtract offset
+	for(int j=0; j<bbox.height(); j++ ){
+		for(int i=0; i<bbox.width(); i++ ){
 			Vector2 pixel_L_prime = HomographyTransform(align_left_matrix).forward(Vector2(i,j));
 			//cout << "pixel_L_prime = " << pixel_L_prime << endl;
-			float dx = stereo_result_inv(i,j)[0];
-			float dy = stereo_result_inv(i,j)[1];
+			float dx = stereo_result_inv(i+margin,j+margin)[0];
+			float dy = stereo_result_inv(i+margin,j+margin)[1];
 			Vector2 pixel_R_prime = pixel_L_prime + Vector2(dx,dy);
 			//cout << "pixel_R_prime = " << pixel_R_prime << endl;
 			Vector2 new_disp = pixel_R_prime - Vector2(i,j);
 			//cout << "new_disp = " << new_disp << endl;
+			//cout << i-marginMinX << " " << j-marginMinY << " ..  ";
 			stereo_result_corrected(i,j)[0] = new_disp.x();
 			stereo_result_corrected(i,j)[1] = new_disp.y();
-			if(stereo_result_mask_inv(i,j))
+			if(stereo_result_mask_inv(i+margin,j+margin))
 				validate(stereo_result_corrected(i,j));
 				//stereo_result_corrected(i,j)[2] = 2147483647;
 		}

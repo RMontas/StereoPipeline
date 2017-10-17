@@ -799,6 +799,8 @@ class SeededCorrelatorView : public ImageViewBase<SeededCorrelatorView> {
   ImageViewRef<PixelMask<Vector2f> > m_sub_disp;
   ImageViewRef<PixelMask<Vector2i> > m_sub_disp_spread;
   ImageView<Matrix3x3> & m_local_hom;
+  ImageView<Matrix3x3> & m_local_hom_L;
+  ImageView<Matrix3x3> & m_local_size;
 
   // Settings
   Vector2  m_upscale_factor;
@@ -824,6 +826,8 @@ public:
                         DispSeedImageType     const& sub_disp,
                         SpreadImageType       const& sub_disp_spread,
                         ImageView<Matrix3x3>  & local_hom,
+						ImageView<Matrix3x3>  & local_hom_L, // Ricardo Monteiro
+						ImageView<Matrix3x3>  & local_size,
                         Vector2i const& kernel_size,
                         stereo::CostFunctionType cost_mode,
                         int corr_timeout, double seconds_per_op):
@@ -831,6 +835,7 @@ public:
     m_left_mask (left_mask.impl ()), m_right_mask (right_mask.impl ()),
     m_sub_disp(sub_disp.impl()), m_sub_disp_spread(sub_disp_spread.impl()),
     m_local_hom(local_hom),
+	m_local_hom_L(local_hom_L), m_local_size(local_size),// Ricardo Monteiro
     m_kernel_size(kernel_size),  m_cost_mode(cost_mode),
     m_corr_timeout(corr_timeout), m_seconds_per_op(seconds_per_op){ 
     m_upscale_factor[0] = double(m_left_image.cols()) / m_sub_disp.cols();
@@ -958,6 +963,9 @@ cout << "start of tile " << bbox << endl;
 		cout << "[tile(" << H << "," << W << " right_size after piecewise alignment = " << right_size << endl;
 		fullres_hom = align_right_matrix;
 		m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts) = fullres_hom;
+		m_local_hom_L(bbox.min().x()/ts, bbox.min().y()/ts) = align_left_matrix;
+		m_local_size(bbox.min().x()/ts, bbox.min().y()/ts)(0,0) = left_size.x();
+        m_local_size(bbox.min().x()/ts, bbox.min().y()/ts)(0,1) = left_size.y();
 		cout << "[tile(" << H << "," << W << " local_search_range = " << local_search_range << endl;
 		
 		cout << "[tile(" << H << "," << W << ") " << fullres_hom << "]" << endl;
@@ -1075,20 +1083,17 @@ cout << "start of tile " << bbox << endl;
 	ImageView<pixel_type> stereo_result_corrected(bbox.width(), bbox.height());
 	for(int j=0; j<bbox.height(); j++ ){
 		for(int i=0; i<bbox.width(); i++ ){
-			Vector2 pixel_L_prime = HomographyTransform(align_left_matrix).forward(Vector2(i,j));
-			//cout << "pixel_L_prime = " << pixel_L_prime << endl;
-			float dx = stereo_result_inv(i+margin,j+margin)[0];
-			float dy = stereo_result_inv(i+margin,j+margin)[1];
-			Vector2 pixel_R_prime = pixel_L_prime + Vector2(dx,dy);
-			//cout << "pixel_R_prime = " << pixel_R_prime << endl;
-			Vector2 new_disp = pixel_R_prime - Vector2(i,j);
-			//cout << "new_disp = " << new_disp << endl;
-			//cout << i-marginMinX << " " << j-marginMinY << " ..  ";
-			stereo_result_corrected(i,j)[0] = new_disp.x();
-			stereo_result_corrected(i,j)[1] = new_disp.y();
+		//	Vector2 pixel_L_prime = HomographyTransform(align_left_matrix).forward(Vector2(i,j));
+		//	float dx = stereo_result_inv(i+margin,j+margin)[0];
+		//	float dy = stereo_result_inv(i+margin,j+margin)[1];
+		//	Vector2 pixel_R_prime = pixel_L_prime + Vector2(dx,dy);
+		//	Vector2 new_disp = pixel_R_prime - Vector2(i,j);
+		//	stereo_result_corrected(i,j)[0] = new_disp.x();
+		//	stereo_result_corrected(i,j)[1] = new_disp.y();
+			stereo_result_corrected(i,j)[0] = stereo_result_inv(i+margin,j+margin)[0];
+			stereo_result_corrected(i,j)[1] = stereo_result_inv(i+margin,j+margin)[1];
 			if(stereo_result_mask_inv(i+margin,j+margin))
 				validate(stereo_result_corrected(i,j));
-				//stereo_result_corrected(i,j)[2] = 2147483647;
 		}
 	}
 
@@ -1193,6 +1198,14 @@ void stereo_correlation( ASPGlobalOptions& opt ) {
     string local_hom_file = opt.out_prefix + "-local_hom.txt";
     read_local_homographies(local_hom_file, local_hom);
   }
+// Ricardo Monteiro
+  ImageView<Matrix3x3> local_hom_L;
+  ImageView<Matrix3x3> local_size; ///// write local left size to disk
+if ( stereo_settings().seed_mode > 0 && stereo_settings().use_local_homography ){
+    string local_hom_file = opt.out_prefix + "-local_hom.txt";
+    read_local_homographies(local_hom_file, local_hom_L);
+	read_local_homographies(local_hom_file, local_size);
+  }
 
   stereo::CostFunctionType cost_mode = get_cost_mode_value();
   Vector2i kernel_size    = stereo_settings().corr_kernel;
@@ -1206,7 +1219,9 @@ void stereo_correlation( ASPGlobalOptions& opt ) {
   // - Processing is limited to trans_crop_win for use with parallel_stereo.
   ImageViewRef<PixelMask<Vector2f> > fullres_disparity =
     crop(SeededCorrelatorView( left_disk_image, right_disk_image, Lmask, Rmask,
-                               sub_disp, sub_disp_spread, local_hom, kernel_size, 
+                               sub_disp, sub_disp_spread, local_hom,
+							   local_hom_L, local_size,  //Ricardo Monteiro
+							   kernel_size, 
                                cost_mode, corr_timeout, seconds_per_op),  
          trans_crop_win);
 
@@ -1265,6 +1280,10 @@ if ( stereo_settings().seed_mode > 0 && stereo_settings().use_local_homography )
     string local_hom_file = opt.out_prefix + "-local_hom.txt";
     write_local_homographies(local_hom_file, local_hom);
     cout << "[Writing homographies]" << endl; 
+    string local_hom_L_file = opt.out_prefix + "-local_hom_L.txt";
+	write_local_homographies(local_hom_L_file, local_hom_L);
+	string local_size_file = opt.out_prefix + "-local_size.txt";
+	write_local_homographies(local_size_file, local_size);
   }
 
   vw_out() << "\n[ " << current_posix_time_string() << " ] : CORRELATION FINISHED \n";

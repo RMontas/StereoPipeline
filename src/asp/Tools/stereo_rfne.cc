@@ -178,25 +178,32 @@ template <class Image1T, class Image2T, class SeedDispT>
 class PerTileRfne: public ImageViewBase<PerTileRfne<Image1T, Image2T, SeedDispT> >{
   Image1T              m_left_image;
   Image2T              m_right_image;
+  ImageViewRef<uint8>  m_left_mask;
   ImageViewRef<uint8>  m_right_mask;
   SeedDispT            m_integer_disp;
   SeedDispT            m_sub_disp;
   ImageView<Matrix3x3> m_local_hom;
+  ImageView<Matrix3x3> m_local_hom_L; // Ricardo Monteiro
+  ImageView<Matrix3x3> m_local_size; // Ricardo Monteiro
   ASPGlobalOptions const&       m_opt;
   Vector2              m_upscale_factor;
 
 public:
   PerTileRfne( ImageViewBase<Image1T>   const& left_image,
                ImageViewBase<Image2T>   const& right_image,
+               ImageViewRef <uint8>     const& left_mask,
                ImageViewRef <uint8>     const& right_mask,
                ImageViewBase<SeedDispT> const& integer_disp,
                ImageViewBase<SeedDispT> const& sub_disp,
                ImageView    <Matrix3x3> const& local_hom,
+			   ImageView    <Matrix3x3> const& local_hom_L, // Ricardo Monteiro
+			   ImageView    <Matrix3x3> const& local_size, // Ricardo Monteiro
                ASPGlobalOptions const& opt):
     m_left_image(left_image.impl()), m_right_image(right_image.impl()),
-    m_right_mask(right_mask),
+    m_left_mask(left_mask), m_right_mask(right_mask),
     m_integer_disp( integer_disp.impl() ), m_sub_disp( sub_disp.impl() ),
-    m_local_hom(local_hom), m_opt(opt){
+    m_local_hom(local_hom), m_local_hom_L(local_hom_L), m_local_size(local_size),
+	m_opt(opt){
 
     m_upscale_factor = Vector2(double(m_left_image.impl().cols()) / m_sub_disp.cols(),
                                double(m_left_image.impl().rows()) / m_sub_disp.rows());
@@ -221,47 +228,109 @@ public:
   typedef CropView<ImageView<pixel_type> > prerasterize_type;
   inline prerasterize_type prerasterize(BBox2i const& bbox) const {
 
-    ImageView<pixel_type> tile_disparity;
+    //ImageView<pixel_type> tile_disparity;
+	ImageView<pixel_type> tile_disparity(bbox.width(), bbox.height());
     bool verbose = false;
     if (stereo_settings().seed_mode > 0 && stereo_settings().use_local_homography){
 
       int ts = ASPGlobalOptions::corr_tile_size();
+	  cartography::GdalWriteOptions geo_opt;
+	  char outputName[30];
+	  int W = bbox.min().x()/ts;
+	  int H = bbox.min().y()/ts;
+	  int margin = 50;
+	  BBox2i newBBox = BBox2i(bbox.min().x(), bbox.min().y(), bbox.max().x(), bbox.max().y());
+	  newBBox.expand(margin);
+	  newBBox.crop(bounding_box(m_left_image));
     //  Matrix<double>  lowres_hom = m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts);
      //  Vector3 upscale( m_upscale_factor[0],     m_upscale_factor[1],     1 );
      // Vector3 dnscale( 1.0/m_upscale_factor[0], 1.0/m_upscale_factor[1], 1 );
-    //  Matrix<double>  fullres_hom = diagonal_matrix(upscale)*lowres_hom*diagonal_matrix(dnscale); RM
+    //  Matrix<double>  fullres_hom = diagonal_matrix(upscale)*lowres_hom*diagonal_matrix(dnscale); 
 	  Matrix<double>  fullres_hom = m_local_hom(bbox.min().x()/ts, bbox.min().y()/ts);
+	  Matrix<double>  fullres_hom_L = m_local_hom_L(bbox.min().x()/ts, bbox.min().y()/ts);
 	  cout << " fullres_hom = " << fullres_hom << endl;
 	  cout << " bbox = " << bbox << endl;
-	  ImageView<PixelGray<float> > tile_right_image = crop(m_right_image.impl(), bbox);
-	  ImageView<vw::uint8> tile_right_image_mask = crop(m_right_mask.impl(), bbox);
+	  ImageView<float> tile_right_image = crop(m_right_image.impl(), newBBox);
+	  ImageView<vw::uint8> tile_right_image_mask = crop(m_right_mask.impl(), newBBox);
+	  ImageView<float> tile_left_image = crop(m_left_image.impl(), newBBox);
+	  ImageView<vw::uint8> tile_left_image_mask = crop(m_left_mask.impl(), newBBox);
+      typedef typename SeedDispT::pixel_type disp_pix_type;
+	  ImageView<disp_pix_type> tile_disp_image = crop(m_integer_disp.impl(), bbox);
+	  ImageView<vw::uint8> tile_disp_image_mask = channel_cast_rescale<uint8>(select_channel(tile_disp_image, 2));
+	  
+	  Vector2i left_size = newBBox.size();
+ 	  Vector2i right_size = newBBox.size();
+	  //BBox2i left_image_bbox;
+	  //left_image_bbox.grow( subvector(fullres_hom_L*Vector3(0,0,1),0,2) );
+      //left_image_bbox.grow( subvector(fullres_hom_L*Vector3(left_size.x(),0,1),0,2) );
+      //left_image_bbox.grow( subvector(fullres_hom_L*Vector3(left_size.x(),left_size.y(),1),0,2) );
+      //left_image_bbox.grow( subvector(fullres_hom_L*Vector3(0,left_size.y(),1),0,2) );
+	  //left_size = Vector2i(left_image_bbox.width(), left_image_bbox.height());
+	  left_size.x() = m_local_size(bbox.min().x()/ts, bbox.min().y()/ts)(0,0);
+	  left_size.y() = m_local_size(bbox.min().x()/ts, bbox.min().y()/ts)(0,1);
+ 	  right_size = left_size;
+	  cout << "left_size = " << left_size << endl;
 
       // Must transform the right image by the local disparity
       // to be in the same conditions as for stereo correlation.
-      typedef typename Image2T::pixel_type right_pix_type;
+      typedef float right_pix_type;
       ImageViewRef< PixelMask<right_pix_type> > right_trans_masked_img
       //  = transform (copy_mask( m_right_image.impl(), create_mask(m_right_mask) ),
       //               HomographyTransform(fullres_hom),
       //               m_left_image.impl().cols(), m_left_image.impl().rows()); 
 		// apply transf to tile individually 
-        = transform (copy_mask( tile_right_image.impl(), create_mask(tile_right_image_mask) ),
+        = transform (copy_mask( tile_right_image, create_mask(tile_right_image_mask) ),
                      HomographyTransform(fullres_hom),
-                     tile_right_image.cols(), tile_right_image.rows());
+                     right_size.x(), right_size.y());
       ImageViewRef<right_pix_type> right_trans_img = apply_mask(right_trans_masked_img);
+	  sprintf(outputName, "aligned_R_%d_%d.tif", H, W);
+	  vw::cartography::block_write_gdal_image(outputName, right_trans_img, geo_opt);
+// Ricardo Monteiro
+	  typedef float left_pix_type;
+      ImageViewRef< PixelMask<left_pix_type> > left_trans_masked_img
+        = transform (copy_mask( tile_left_image, create_mask(tile_left_image_mask) ),
+                     HomographyTransform(fullres_hom_L),
+                     left_size.x(), left_size.y());
+      ImageViewRef<left_pix_type> left_trans_img = apply_mask(left_trans_masked_img);
+	  sprintf(outputName, "aligned_L_%d_%d.tif", H, W);
+	  vw::cartography::block_write_gdal_image(outputName, left_trans_img, geo_opt);
 
-      tile_disparity = crop(refine_disparity(m_left_image, right_trans_img,
-                                             m_integer_disp, m_opt, verbose), bbox);
+	  ImageViewRef<disp_pix_type> disp_trans_img
+        = transform ( tile_disp_image,
+                     HomographyTransform(fullres_hom_L),
+                     left_size.x(), left_size.y(), ConstantEdgeExtension());
+	  sprintf(outputName, "disp_%d_%d.tif", H, W);
+	  vw::cartography::block_write_gdal_image(outputName, disp_trans_img, geo_opt);
+
+	  BBox2i newBBoxDisp = BBox2i(0, 0, left_size.x(), left_size.y());
+	  ImageView<pixel_type> tile_disparity_trans;
+	  tile_disparity_trans = crop(refine_disparity(left_trans_img, right_trans_img,
+ 											   disp_trans_img, m_opt, verbose), newBBoxDisp);
+
+      sprintf(outputName, "disp1_%d_%d.tif", H, W);
+	  vw::cartography::block_write_gdal_image(outputName, tile_disparity_trans, geo_opt);
+
+		ImageView<pixel_type> tile_disparity_trans_inv
+			= transform (tile_disparity_trans,
+	               HomographyTransform(inverse(fullres_hom_L)),
+					newBBox.width(), newBBox.height());
+
+	  sprintf(outputName, "disp2_%d_%d.tif", H, W);
+	  vw::cartography::block_write_gdal_image(outputName, tile_disparity_trans_inv, geo_opt);
+
+	  
 
       // Must undo the local homography transform
       //bool do_round = false; // don't round floating point disparities
      // tile_disparity = transform_disparities(do_round, bbox, inverse(fullres_hom),
-      //                                       tile_disparity);
-
-	  // overwrite tile_disparity by adjusting right tile and calculating the new disparity (unaligned L and unaligned R)
-
-	  for(int j=0; j<tile_right_image.rows(); j++ ){
-		for(int i=0; i<tile_right_image.cols(); i++ ){
-			Vector2 pixel_R = HomographyTransform(fullres_hom).forward(Vector2(i,j));
+      //                                       tile_disparity);	
+	  // adding margin for non edge cases
+	  double marginMinX = bbox.min().x() == 0 ? 0 : margin;
+	  double marginMinY = bbox.min().y() == 0 ? 0 : margin;
+// overwrite tile_disparity by adjusting right tile and calculating the new disparity (unaligned L and unaligned R)
+	  for(int j=0; j<bbox.height(); j++ ){
+		for(int i=0; i<bbox.width(); i++ ){
+			/*Vector2 pixel_R = HomographyTransform(fullres_hom).forward(Vector2(i,j));
 			float dx = tile_disparity(i,j)[0];
 			float dy = tile_disparity(i,j)[1];
 			Vector2 pixel_L = pixel_R - Vector2(dx,dy);
@@ -269,9 +338,42 @@ public:
 			tile_disparity(i,j)[0] = new_disp.x();
 			tile_disparity(i,j)[1] = new_disp.y();
 			if(right_trans_masked_img(i,j))
+				validate(tile_disparity(i,j));*/
+
+			Vector2 pixel_L = HomographyTransform(fullres_hom_L).forward(Vector2(i,j));
+			float dx = tile_disparity_trans_inv(i,j)[0];
+			float dy = tile_disparity_trans_inv(i,j)[1];
+			Vector2 pixel_R = pixel_L + Vector2(dx,dy);
+			Vector2 disp_L_R = pixel_R - Vector2(i,j);
+			pixel_R = HomographyTransform(fullres_hom).forward(Vector2(i,j));
+			pixel_L = pixel_R - disp_L_R;
+			disp_L_R = Vector2(i,j) - pixel_L;
+			tile_disparity(i,j)[0] = disp_L_R.x();
+			tile_disparity(i,j)[1] = disp_L_R.y();
+			if(tile_disp_image_mask(i,j))
 				validate(tile_disparity(i,j));
+			
+
+			/*Vector2 pixel_R_prime = HomographyTransform(fullres_hom).forward(Vector2(i,j));
+			float dx = tile_disparity_trans_inv(i,j)[0];
+			float dy = tile_disparity_trans_inv(i,j)[1];
+			Vector2 pixel_L_prime = pixel_R_prime - Vector2(dx,dy);
+			Vector2 disp_L_prime_R = Vector2(i,j) - pixel_L_prime;
+			Vector2 pixel_L = HomographyTransform(fullres_hom_L).forward(Vector2(i,j));
+			Vector2 pixel_R = pixel_L + disp_L_prime_R;
+			Vector2 disp_L_R = pixel_R - Vector2(i,j); 
+//cout << disp_L_R << endl;
+			tile_disparity(i,j)[0] = disp_L_R.x();
+			tile_disparity(i,j)[1] = disp_L_R.y();
+			if(tile_disp_image_mask(i,j))
+				validate(tile_disparity(i,j));*/
+
+
 		}
 	}
+	
+	sprintf(outputName, "disp3_%d_%d.tif", H, W);
+	vw::cartography::block_write_gdal_image(outputName, tile_disparity, geo_opt);
 
     }else{
       tile_disparity = crop(refine_disparity(m_left_image, m_right_image,
@@ -294,14 +396,19 @@ template <class Image1T, class Image2T, class SeedDispT>
 PerTileRfne<Image1T, Image2T, SeedDispT>
 per_tile_rfne( ImageViewBase<Image1T  > const& left,
                ImageViewBase<Image2T  > const& right,
+               ImageViewRef<uint8     > const& left_mask, // Ricardo Monteiro
                ImageViewRef<uint8     > const& right_mask,
                ImageViewBase<SeedDispT> const& integer_disp,
                ImageViewBase<SeedDispT> const& sub_disp,
                ImageView<Matrix3x3    > const& local_hom,
+			   ImageView<Matrix3x3    > const& local_hom_L, // Ricardo Monteiro
+			   ImageView<Matrix3x3    > const& local_size,
                ASPGlobalOptions const& opt) {
   typedef PerTileRfne<Image1T, Image2T, SeedDispT> return_type;
-  return return_type( left.impl(), right.impl(), right_mask,
-                      integer_disp.impl(), sub_disp.impl(), local_hom, opt );
+  return return_type( left.impl(), right.impl(), left_mask, right_mask,
+                      integer_disp.impl(), sub_disp.impl(), local_hom,
+					  local_hom_L, local_size,
+					  opt );
 }
 
 void stereo_refinement( ASPGlobalOptions const& opt ) {
@@ -311,6 +418,9 @@ void stereo_refinement( ASPGlobalOptions const& opt ) {
   ImageViewRef<PixelMask<Vector2f> > integer_disp;
   ImageViewRef<PixelMask<Vector2f> > sub_disp;
   ImageView<Matrix3x3> local_hom;
+// Ricardo Monteiro
+  ImageView<Matrix3x3> local_hom_L;
+  ImageView<Matrix3x3> local_size;
   string left_image_file  = opt.out_prefix+"-L.tif";
   string right_image_file = opt.out_prefix+"-R.tif";
   string left_mask_file   = opt.out_prefix+"-lMask.tif";
@@ -338,6 +448,10 @@ void stereo_refinement( ASPGlobalOptions const& opt ) {
 
       string local_hom_file = opt.out_prefix + "-local_hom.txt";
       read_local_homographies(local_hom_file, local_hom);
+	  string local_hom_L_file = opt.out_prefix + "-local_hom_L.txt";
+      read_local_homographies(local_hom_L_file, local_hom_L);
+	  string local_size_file = opt.out_prefix + "-local_size.txt";
+      read_local_homographies(local_size_file, local_size);
     }
 
   } catch (IOErr const& e) {
@@ -377,8 +491,12 @@ void stereo_refinement( ASPGlobalOptions const& opt ) {
   refine_disparity(left_dummy, right_dummy, dummy_disp, opt, verbose);
 
   ImageViewRef< PixelMask<Vector2f> > refined_disp
-    = crop(per_tile_rfne(left_image, right_image, right_mask,
-                    integer_disp, sub_disp, local_hom, opt), 
+    = crop(per_tile_rfne(left_image, right_image, 
+			 left_mask, // Ricardo Monteiro
+			 right_mask,
+             integer_disp, sub_disp, local_hom,
+			 local_hom_L, local_size, // Ricardo Monteiro
+			 opt), 
            stereo_settings().trans_crop_win);
   
   cartography::GeoReference left_georef;

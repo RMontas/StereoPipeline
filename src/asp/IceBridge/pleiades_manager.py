@@ -21,7 +21,7 @@
 #   superceded by another script.
 
 import os, sys, argparse, datetime, time, subprocess, logging, multiprocessing
-import re, shutil, time, getpass
+import re, shutil, glob
 
 import os.path as P
 
@@ -53,51 +53,86 @@ os.environ["PATH"] = icebridgepath  + os.pathsep + os.environ["PATH"]
 
 # Constants used in this file
 
-STEREO_ALGORITHM = 2 # 1 = SGM, 2 = MGM
-
-ORTHO_PBS_QUEUE = 'normal'
-BATCH_PBS_QUEUE = 'normal'
-MAX_ORTHO_HOURS = 8
-MAX_BATCH_HOURS = 8 # devel limit is 2, long limit is 120, normal is 8
+CAMGEN_PBS_QUEUE   = 'normal'
+BATCH_PBS_QUEUE    = 'normal'
+BLEND_PBS_QUEUE    = 'normal'
+ORTHOGEN_PBS_QUEUE = 'normal'
+LABEL_PBS_QUEUE = 'normal'
 
 GROUP_ID = 's1827'
 
-# Wait this long between checking for job completion
-SLEEP_TIME = 60
+g_start_time = -1
+g_stop_time  = -1
 
+def start_time():
+    global g_start_time, g_stop_time
+    g_start_time = time.time()
+    
+def stop_time(job, logger):
+    global g_start_time, g_stop_time
+    g_stop_time = time.time()
+    wall_s = float(g_stop_time - g_start_time)/3600.0
+    logger.info( ("Elapsed time for %s is %g hours." % (job, wall_s) ) )
+
+
+PFE_NODES = ['san', 'ivy', 'has', 'bro']
 
 #=========================================================================
 
 # 'wes' = Westmere = 12 cores/24 processors, 48 GB mem, SBU 1.0, Launch from mfe1 only!
 # 'san' = Sandy bridge = 16 cores,  32 GB mem, SBU 1.82
-# 'ivy' = Ivy bridge    = 20 cores,  64 GB mem, SBU 2.52
+# 'ivy' = Ivy bridge   = 20 cores,  64 GB mem, SBU 2.52
 # 'has' = Haswell      = 24 cores, 128 GB mem, SBU 3.34
 # 'bro' = Broadwell    = 28 cores, 128 GB mem, SBU 4.04
 
-def getParallelParams(nodeType, ortho=False):
-    '''Return (numProcesses, numThreads, tasksPerJob) for running a certain task on a certain node type'''
+def getParallelParams(nodeType, task):
+    '''Return (numProcesses, numThreads, tasksPerJob, maxHours) for running a certain task on a certain node type'''
 
     # Define additional combinations and edit as needed.
 
-    if ortho:
-        if nodeType == 'ivy': return (10, 2, 400)
-        if nodeType == 'bro': return (14, 2, 500)
+    if task == 'camgen':
+        if nodeType == 'san': return (8,  3, 300, 3)
+        if nodeType == 'ivy': return (10, 3, 400, 3)
+        if nodeType == 'bro': return (14, 4, 500, 3)
+        if nodeType == 'wes': return (10, 4, 400, 8)
     
-    else: # Batch processing
+    if task == 'dem':
+        if nodeType == 'san': return (2, 8, 70,  8)
+        if nodeType == 'ivy': return (4, 8, 80,  8)
+        if nodeType == 'bro': return (6, 8, 100, 8)
+        if nodeType == 'wes': return (3, 8, 75,  8)
+    
+    if task == 'blend':
+        if nodeType == 'san': return (8,  3,  800, 4)
+        if nodeType == 'ivy': return (10, 3, 1000, 4)
+        if nodeType == 'bro': return (14, 4, 1400, 4) # 200 seems to finish in 10 minutes
+        if nodeType == 'wes': return (10, 3,  800, 8) 
+    
+    if task == 'orthogen':
+        if nodeType == 'san': return (8,  2, 350, 6)
+        if nodeType == 'ivy': return (10, 2, 400, 5)
+        if nodeType == 'bro': return (14, 4, 500, 4)
+        if nodeType == 'wes': return (10, 4, 400, 8)
 
-        if nodeType == 'ivy': return (3, 8, 80)
-        if nodeType == 'bro': return (4, 8, 100)
-    
-    # TODO: Blend step
-    
-    raise Exception('No params defined for node type ' + nodeType + ', ortho = ' + str(ortho))
+    # TODO: All guesses!
+    if task == 'label':
+        if nodeType == 'san': return (16, 1, 350, 6)
+        if nodeType == 'ivy': return (30, 1, 400, 5)
+        if nodeType == 'bro': return (28, 1, 500, 4)
+        if nodeType == 'wes': return (12, 1, 400, 8)
 
+
+    raise Exception('No params defined for node type ' + nodeType + ', task = ' + task)
 
 #=========================================================================
 
-def getUser():
-    '''Return the current user name.'''
-    return getpass.getuser()
+def getLabelTrainingPath(userName):
+    '''Path to the OSSP label training file'''
+
+    if userName == 'smcmich1':
+        return '/u/smcmich1/repo/OSSP/training_datasets/icebridge_v1_training_data.h5'
+    if userName == 'oalexan1':
+        raise Exception('Need to set the label training path!')
 
 def getEmailAddress(userName):
     '''Return the email address to use for a user'''
@@ -109,8 +144,16 @@ def getEmailAddress(userName):
 
 def sendEmail(address, subject, body):
     '''Send a simple email from the command line'''
-    os.system('mail -s '+subject+' '+address+' <<< '+body)
-
+    # Remove any quotes, as that confuses the command line.
+    subject = subject.replace("\"", "")
+    body    = body.replace("\"", "")
+    try:
+        cmd = 'mail -s "' + subject + '" ' + address + ' <<< "' + body + '"'
+        #print(cmd) # too verbose to print
+        os.system(cmd)
+    except Exception, e:
+        print("Could not send mail.")
+        
 #---------------------------------------------------------------------
 
 def readRunList(path, options):
@@ -146,209 +189,479 @@ def getRunsToProcess(allRuns, skipRuns, doneRuns):
 #---------------------------------------------------------------------
 
 
-def runFetch(run, options):
+def runFetch(run, options, logger):
     '''Fetch all the data for a run if it is not already available'''
 
-    logger = logging.getLogger(__name__)
+    logger.info("Checking all data is present.")
 
     # Check if already done
-    try:
-        if run.allSourceDataFetched():
-            logger.info('Fetch is already complete.')
-            return
-    except Exception, e:
-        logger.warning('Caught error checking fetch status, re-running fetch.\n'
+    allIsFetched = False
+    if options.skipCheckInputs:
+        allIsFetched = True
+    else:
+        try:
+            # Note that the check below is incomplete, it does not check for Fireball
+            allIsFetched = run.allSourceDataFetched(options.noNavFetch)
+        except Exception, e:
+            allIsFetched = False
+            logger.warning('Caught error checking fetch status.\n'
                        + str(e))
 
-    # Call the fetch command
-    archive_functions.retrieveRunData(run, options.unpackDir)
+    # Fetch the archive from lfe, only in the case the directory is not present
+    if not options.skipTapeFetch:
+        archive_functions.retrieveRunData(run, options.unpackDir, options.useTar,
+                                          options.forceTapeFetch, logger)
+
+    pythonPath = asp_system_utils.which('python')
     
-    # Go ahead and refetch the indices since it helps to have these up-to-date.
-    cmd = ('full_processing_script.py --camera-calibration-folder %s --reference-dem-folder %s --site %s --yyyymmdd %s --output-folder %s --refetch-index --stop-after-index-fetch' % (options.inputCalFolder, options.refDemFolder, run.site, run.yyyymmdd, run.getFolder()))
-    logger.info(cmd)
-    os.system(cmd)
+    # Fetch whatever is missing directly from NSIDC, and force to have the indices
+    # regenerated in this case. Hopefully just a few files are missing.
+    # - This is likely to have to fetch the large nav data file(s).
+    # Note that we do all conversions as well, sans camera generation. But hopefully the run is clean and all
+    # has been done by now. 
+    if not options.noRefetch:
+        logger.info("Fetch from NSIDC.")
+        cmd = (pythonPath + ' ' + icebridge_common.fullPath('full_processing_script.py') + ' --camera-calibration-folder %s --reference-dem-folder %s --site %s --yyyymmdd %s --output-folder %s --refetch --stop-after-fetch --start-frame %d --stop-frame %d' % (options.inputCalFolder, options.refDemFolder, run.site, run.yyyymmdd, run.getFolder(), options.startFrame, options.stopFrame))
+
+        if options.noNavFetch:
+            cmd += ' --no-nav'
+            
+        if options.skipValidate or options.parallelValidate:
+            # We will do validation in parallel later
+            cmd += ' --skip-validate'
+
+        if not options.noRefetchIndex:
+            cmd += ' --refetch-index'
+            
+        logger.info(cmd)
+        os.system(cmd)
+
+    # Rename to the newest convention of computing the timestamp.
+    # This must happen after all is fetched from tape and we
+    # refreshed the indicies from NSIDC.
+    run.massRename(options.startFrame, options.stopFrame, logger)
     
     # Don't need to check results, they should be cleaned out in conversion call.
-
     run.setFlag('fetch_complete')
-            
 
-def runConversion(run, options):
+def runConversion(run, options, conversionAttempt, logger):
     '''Run the conversion tasks for this run on the supercomputer nodes.
-       This will also run through the fetch step to make sure we have everything we need.'''
-    
-    logger = logging.getLogger(__name__)
-    
-    # Check if already done
+       This will also run through the fetch step to make sure we have everything we need.
+       Note: This function calls itself!'''
+
+    # Check if already done. If we want to validate in parallel, we must still
+    # go through this step, though hopefully it will be very fast then.
+    # TODO: Can have a check if all files have been validated (jpeg, ortho, image, etc),
+    # and then, if all cameras are also present, this step can be skipped.
     try:
-        if run.conversionIsFinished():
+        if run.conversionIsFinished(options.startFrame, options.stopFrame)   and \
+           run.checkForImages(options.startFrame, options.stopFrame, logger) and \
+           (not options.parallelValidate):
             logger.info('Conversion is already complete.')
             return
     except Exception, e:
-        logger.warning('Caught error checking conversion status, re-running conversion.\n'
-                       + str(e))
+        logger.warning('Caught error checking conversion status, re-running conversion.\n' + str(e))
         
     logger.info('Converting data for run ' + str(run))
-            
-    
-    # Get the frame range for the data.
-    (minFrame, maxFrame) = run.getFrameRange()
-    
-    logger.info('Detected frame range: ' + str((minFrame, maxFrame)))
 
+    # Run just the nav data --> estimated camera conversion on the PFE machine.
+    # - This is single threaded and may take a while but is primarily IO driven.
+    # - We can't start the slower ortho2pinhole processes until this is finished.
+    # - If all of the camera files already exist this call will finish up very quickly.
+    if not options.noNavFetch:
+        logger.info("Generating estimated camera files from the navigation files.")
+        pythonPath = asp_system_utils.which('python')
+        cmd = (pythonPath + ' ' + icebridge_common.fullPath('full_processing_script.py') + ' --camera-calibration-folder %s --reference-dem-folder %s --site %s --yyyymmdd %s --output-folder %s --skip-fetch --stop-after-convert --no-lidar-convert --no-ortho-convert --skip-fast-conversions --start-frame %d --stop-frame %d' % (options.inputCalFolder, options.refDemFolder, run.site, run.yyyymmdd, run.getFolder(), options.startFrame, options.stopFrame))
+    
+        if options.skipValidate or options.parallelValidate:
+            cmd += ' --skip-validate'
+            
+        logger.info(cmd)
+        os.system(cmd)    
+        logger.info("Finished generating estimated camera files from nav.")
+    
     # Retrieve parallel processing parameters
-    (numProcesses, numThreads, tasksPerJob) = getParallelParams(options.nodeType, ortho=True)
+    (numProcesses, numThreads, tasksPerJob, maxHours) = getParallelParams(options.nodeType, 'camgen')
     
     # Split the conversions across multiple nodes using frame ranges
-    # - The first job submitted will be the only one that converts the lidar data
-    numFrames    = maxFrame - minFrame + 1
-    numOrthoJobs = numFrames / tasksPerJob
-    
+    # - The first job submitted will be the only one that converts the lidar data.
+    # We will also run validation in parallel.
+    numFrames    = options.stopFrame - options.startFrame + 1
+    numCamgenJobs = numFrames / tasksPerJob
+    if numCamgenJobs < 1:
+        numCamgenJobs = 1
+        
     outputFolder = run.getFolder()
-    
-    scriptPath = asp_system_utils.which('full_processing_script.py')
-    args       = ('--camera-calibration-folder %s --reference-dem-folder %s --site %s --yyyymmdd %s --stop-after-convert --num-threads %d --num-processes %d --output-folder %s --skip-validate' 
-                  % (options.inputCalFolder, options.refDemFolder, run.site, run.yyyymmdd, numThreads, numProcesses, outputFolder))
-    
+
+    scriptPath = icebridge_common.fullPath('full_processing_script.py')
+    args       = (' --skip-fetch --camera-calibration-folder %s --reference-dem-folder %s --site %s --yyyymmdd %s --stop-after-convert --num-threads %d --num-processes %d --output-folder %s' 
+                  % ( options.inputCalFolder, options.refDemFolder, run.site, run.yyyymmdd, numThreads, numProcesses, outputFolder))
+    if options.noNavFetch:
+        args += ' --no-nav'
+    if options.simpleCameras:       # This option greatly decreases the conversion run time
+        args += ' --simple-cameras' # - Camera conversion could be local but image conversion still takes time.
+        maxHours = 1
+
     baseName = run.shortName() # SITE + YYMMDD = 8 chars, leaves seven for frame digits.
 
     # Get the location to store the logs    
     pbsLogFolder = run.getPbsLogFolder()
     os.system('mkdir -p ' + pbsLogFolder)
-    
+
     # Submit all the jobs
-    currentFrame = minFrame
-    for i in range(0, numOrthoJobs):
-        jobName    = str(currentFrame) + baseName
+    currentFrame = options.startFrame
+    jobList = []
+    for i in range(0, numCamgenJobs):
+        jobName    = ('%s%06d%s' % ('C', currentFrame, baseName) ) # C for camera
         startFrame = currentFrame
         stopFrame  = currentFrame+tasksPerJob-1
-        if (i == numOrthoJobs - 1):
-            stopFrame = maxFrame # Make sure nothing is lost at the end
-        thisArgs = (args + ' --start-frame ' + str(startFrame) + ' --stop-frame ' + str(stopFrame) )
+        if (i == numCamgenJobs - 1):
+            stopFrame = options.stopFrame # Make sure nothing is lost at the end
+
+        thisArgs = (args + ' --start-frame ' + str(startFrame)
+                         + ' --stop-frame  ' + str(stopFrame ) )
         if i != 0: # Only the first job will convert lidar files
             thisArgs += ' --no-lidar-convert'
+
         logPrefix = os.path.join(pbsLogFolder, 'convert_' + jobName)
-        logger.info('Submitting conversion job with args: '+thisArgs)
-        pbs_functions.submitJob(jobName, ORTHO_PBS_QUEUE, MAX_ORTHO_HOURS, GROUP_ID, options.nodeType, scriptPath, thisArgs, logPrefix)
-        
+        logger.info('Submitting camera generation job: ' + scriptPath + ' ' + thisArgs)
+        pbs_functions.submitJob(jobName, CAMGEN_PBS_QUEUE, maxHours, logger,
+                                options.minutesInDevelQueue,
+                                GROUP_ID,
+                                options.nodeType, '/usr/bin/python2.7',
+                                scriptPath + " " + thisArgs, logPrefix)
+        jobList.append(jobName)
         currentFrame += tasksPerJob
 
     # Wait for conversions to finish
-    waitForRunCompletion(baseName)
+    pbs_functions.waitForJobCompletion(jobList, logger)
+
+    if options.parallelValidate:
+
+        # Consolidate various validation files done in parallel, to make the subsequent
+        # step faster.
+        validFilesList = icebridge_common.validFilesList(outputFolder,
+                                                         options.startFrame, options.stopFrame)
+        validFilesSet = set()
+        validFilesSet = icebridge_common.updateValidFilesListFromDisk(validFilesList, validFilesSet)
+        allValidFiles = glob.glob(os.path.join(outputFolder,
+                                               icebridge_common.validFilesPrefix() + '*'))
+        for fileName in allValidFiles:
+            validFilesSet = icebridge_common.updateValidFilesListFromDisk(fileName, validFilesSet)
+        icebridge_common.writeValidFilesList(validFilesList, validFilesSet)
+
+        # Now we will refetch and reprocess all files that were not
+        # valid so far. Hopefully not too many. This must be on a head
+        # node to be able to access the network. We don't do any orthoconvert
+        # here as that one is too time-consuming
+        logger.info("Refetch and process any invalid files.")
+        pythonPath = asp_system_utils.which('python')
+        cmd = (pythonPath + ' ' + icebridge_common.fullPath('full_processing_script.py') + ' --refetch --camera-calibration-folder %s --reference-dem-folder %s --site %s --yyyymmdd %s --output-folder %s --stop-after-convert --no-ortho-convert --start-frame %d --stop-frame %d --num-threads %d --num-processes %d' % (options.inputCalFolder, options.refDemFolder, run.site, run.yyyymmdd, run.getFolder(), options.startFrame, options.stopFrame, numThreads, numProcesses))
+        if options.noNavFetch:
+            cmd += ' --no-nav'
+        logger.info(cmd)
+        os.system(cmd)
+
+        # See if there are any new files for which we need to run ortho2pinhole on some node
+        logger.info("See for which files to redo ortho.")
+        (orthoList, numFrames) = \
+                    icebridge_common.orthoListToRerun(validFilesSet, outputFolder,
+                                                      options.startFrame, options.stopFrame)
+        
+        logger.info("Number of cameras to regenerate using ortho2pinhole: " + str(numFrames))
+        if numFrames > 0:
+            if numFrames > tasksPerJob and conversionAttempt == 0:
+                # Too many frames, just rerun all jobs
+                conversionAttempt = 1
+                logger.info("Re-running conversion with many nodes.")
+                runConversion(run, options, conversionAttempt, logger)
+                return
+            
+            logger.info("Re-running conversion with one node.")
+            cmd = (icebridge_common.fullPath('full_processing_script.py') + ' --skip-fetch --skip-validate --skip-fast-conversions --stop-after-convert --camera-calibration-folder %s --reference-dem-folder %s --site %s --yyyymmdd %s --output-folder %s --start-frame %d --stop-frame %d --num-threads %d --num-processes %d --frames-file %s' % (options.inputCalFolder, options.refDemFolder, run.site, run.yyyymmdd, run.getFolder(), options.startFrame, options.stopFrame, numThreads, numProcesses, orthoList))
+            if options.noNavFetch:
+                cmd += ' --no-nav'
+
+            #logger.info(cmd)
+            jobList = []
+            jobName    = ('%s%06d%s' % ('C', 0, baseName) ) # C for camera
+            logPrefix = os.path.join(pbsLogFolder, 'convert_' + jobName)
+            logger.info('Submitting camera generation job: ' + cmd)
+            pbs_functions.submitJob(jobName, CAMGEN_PBS_QUEUE, maxHours, logger,
+                                    options.minutesInDevelQueue,
+                                    GROUP_ID,
+                                    options.nodeType, '/usr/bin/python2.7',
+                                    cmd, logPrefix)
+            jobList.append(jobName)
+            
+            # Wait for conversions to finish
+            pbs_functions.waitForJobCompletion(jobList, logger, baseName)
+
+        logger.info("Finished refetching and reprocessing.")
 
     # Check the results
     # - If we didn't get everything keep going and process as much as we can.
-    if not run.conversionIsFinished(verbose=True):
+    success = False
+    try:
+        success = run.conversionIsFinished(options.startFrame, options.stopFrame, verbose = True)
+    except Exception, e:
+        logger.warning('Caught error checking conversion status.\n' + str(e))
+
+    if not success:
         #raise Exception('Failed to convert run ' + str(run))
         logger.warning('Could not fully convert run ' + str(run))
-        
+
     run.setFlag('conversion_complete')
 
-    # Pack up camera folder and store it for later
-    gotCameras = archive_functions.packAndSendCameraFolder(run)
-
-def generateBatchList(run, options, listPath):
+def generateBatchList(run, options, listPath, logger):
     '''Generate a list of all the processing batches required for a run'''
 
-    logger = logging.getLogger(__name__)
+    logger.info("Generate batch list: " + listPath)
     
     refDemName = icebridge_common.getReferenceDemName(run.site)
     refDemPath = os.path.join(options.refDemFolder, refDemName)
 
     # Retrieve parallel processing parameters
-    (numProcesses, numThreads, tasksPerJob) = getParallelParams(options.nodeType, ortho=False)
+    (numProcesses, numThreads, tasksPerJob, maxHours) = getParallelParams(options.nodeType, 'dem')
 
     # No actual processing is being done here so it can run on the PFE
-    # - This is very fast so we can re-run it every time. (Maybe not...)
-    scriptPath = asp_system_utils.which('full_processing_script.py')
-    cmd       = ('%s --camera-calibration-folder %s --reference-dem-folder %s --site %s --yyyymmdd %s --skip-fetch --skip-convert --num-threads %d --num-processes %d --output-folder %s --bundle-length %d --log-batches' 
-                  % (scriptPath, options.inputCalFolder, options.refDemFolder, run.site, run.yyyymmdd, numThreads, numProcesses, run.getFolder(), options.bundleLength))
+    # - No start/stop frames here, always generate the full list so it is stable.
+    pythonPath = asp_system_utils.which('python')
+    scriptPath = icebridge_common.fullPath('full_processing_script.py')
+    cmd       = ('%s %s --camera-calibration-folder %s --reference-dem-folder %s --site %s --yyyymmdd %s --skip-fetch --skip-convert --num-threads %d --num-processes %d --output-folder %s --bundle-length %d --log-batches ' 
+                  % (pythonPath, scriptPath, options.inputCalFolder, options.refDemFolder, run.site, run.yyyymmdd, numThreads, numProcesses, run.getFolder(), options.bundleLength))
 
+    # For full runs we must cleanup, as otherwise we'll run out of space
+    if not options.skipCleanup:
+        cmd += ' --cleanup'
+
+    if options.noNavFetch:
+        cmd += ' --no-nav'
 
 # TODO: Find out what takes so long here!
 # - Also fix the logging!
 
     logger.info(cmd)
     os.system(cmd)
-    
 
-def submitBatchJobs(run, batchListPath):
+
+def getOutputFolderFromBatchCommand(batchCommand):
+    '''Extract the output folder from a line in the batch file'''
+    m = re.match('^.*?--output-folder\s+(.*?)\s', batchCommand)
+    if not m:
+        raise Exception('Failed to extract output folder from: ' + batchCommand)
+    return m.group(1)
+
+# TODO: Share code with the other function
+def filterBatchJobFile(run, batchListPath, logger):
+    '''Make a copy of the batch list file which only contains incomplete batches.'''
+    
+    runFolder = run.getFolder()
+    
+    newBatchPath = batchListPath + '_onlyFailed.txt'
+
+    # Make sure each batch produced the aligned DEM file
+    #batchOutputName = 'out-blend-DEM.tif'
+    batchOutputName = 'out-align-DEM.tif'
+    
+    fIn = open(batchListPath, 'r')
+    fOut = open(newBatchPath, 'w')
+    for line in fIn:
+        outputFolder = getOutputFolderFromBatchCommand(line)
+        targetPath   = os.path.join(outputFolder, batchOutputName)
+        if not os.path.exists(targetPath):
+            fOut.write(line)
+    fIn.close()
+    fOut.close()
+
+    return newBatchPath
+    
+def submitBatchJobs(run, options, batchListPath, logger):
     '''Read all the batch jobs required for a run and distribute them across job submissions.
        Returns the common string in the job names.'''
-
-    logger = logging.getLogger(__name__)
 
     if not os.path.exists(batchListPath):
         logger.error('Failed to generate batch list file: ' + batchListPath)
         raise Exception('Failed to generate batch list file: ' + batchListPath)
 
-    # Number of batches = number of lines in the file
-    p = subprocess.Popen(['wc', '-l', batchListPath], stdout=subprocess.PIPE)
-    textOutput, err = p.communicate()
-    numBatches      = int(textOutput.split()[0])
-    
-    
     # Retrieve parallel processing parameters
-    (numProcesses, numThreads, tasksPerJob) = getParallelParams(options.nodeType, ortho=False)   
-    numBatchJobs = numBatches / tasksPerJob
+    (numProcesses, numThreads, tasksPerJob, maxHours) = getParallelParams(options.nodeType, 'dem')
+
+    # Read the batch list
+    logger.info("Reading batch list: " + batchListPath)
+    batchLines = []
+    with open(batchListPath, 'r') as f:
+        text = f.read()
+        batchLines = text.split('\n')
+
+    # Find all lines in the batch list in range
+    framesInRange = []
+    for line in batchLines:
+        if line == "":
+            continue
+        (begFrame, endFrame) = icebridge_common.getFrameRangeFromBatchFolder(line)
+        if begFrame >= options.startFrame and begFrame < options.stopFrame:
+            framesInRange.append(begFrame)
+
+    frameGroups  = icebridge_common.partitionArray(framesInRange, tasksPerJob)
+    numBatches   = len(framesInRange)
+    numBatchJobs = len(frameGroups)
+    
+    logger.info( ("Num batches: %d, tasks per job: %d, number of jobs: %d" %
+                  (numBatches, tasksPerJob, numBatchJobs) ) )
 
     baseName = run.shortName() # SITE + YYMMDD = 8 chars, leaves seven for frame digits.
 
     # Call the tool which just executes commands from a file
-    scriptPath = asp_system_utils.which('multi_process_command_runner.py')
+    scriptPath = icebridge_common.fullPath('multi_process_command_runner.py')
 
     outputFolder = run.getFolder()
     pbsLogFolder = run.getPbsLogFolder()
 
-    currentBatch = 0
-    for i in range(0, numBatchJobs):
-        jobName    = str(currentBatch) + baseName
-        startBatch = currentBatch
-        stopBatch  = currentBatch+numBatchesPerNode
-        if (i == numBatchJobs-1):
-            stopBatch = numBatches-1 # Make sure nothing is lost at the end
+    jobList = []
+    for group in frameGroups:
+        if len(group) == 0:
+            continue
+        firstFrame = group[0]
+        lastFrame  = group[-1] + 1 # go one beyond
+        jobName    = ('%s%06d%s' % ('D', firstFrame, baseName) ) # D for DEM
 
         # Specify the range of lines in the file we want this node to execute
-        args = ('%s %d %d %d' % (batchListPath, numProcesses, currentBatch, currentBatch+numBatchesPerNode))
+        args = ('--command-file-path %s --start-frame %d --stop-frame %d --num-processes %d' % \
+                (batchListPath, firstFrame, lastFrame, numProcesses))
 
-        logPrefix = os.path.join(pbsLogFolder, 'batch_' + jobName)
-        logger.info('Submitting batch job with args: '+args)
-        pbs_functions.submitJob(jobName, BATCH_PBS_QUEUE, MAX_BATCH_HOURS, GROUP_ID, options.nodeType, scriptPath, args, logPrefix)
+        if options.redoFrameList != "":
+            args += ' --force-redo-these-frames ' + options.redoFrameList
         
-        currentBatch += tasksPerJob
+        logPrefix = os.path.join(pbsLogFolder, 'batch_' + jobName)
+        logger.info('Submitting DEM creation job: ' + scriptPath + ' ' + args)
+
+        pbs_functions.submitJob(jobName, BATCH_PBS_QUEUE, maxHours, logger,
+                                options.minutesInDevelQueue,
+                                GROUP_ID,
+                                options.nodeType, '/usr/bin/python2.7',
+                                scriptPath + ' ' + args, logPrefix)
+        jobList.append(jobName)
 
     # Waiting on these jobs happens outside this function
-    return baseName
+    return (baseName, jobList)
 
-# TODO: Move this
-def waitForRunCompletion(text):
-    '''Sleep until all of the submitted jobs containing the provided text have completed'''
-
-    print 'Waiting for jobs with text: ' + text
-
-    jobsRunning = []
-    user = getUser()
-    stillWorking = True
-    while stillWorking:
-        time.sleep(SLEEP_TIME)
-        stillWorking = False
-
-        # Look through the list for jobs with the run's date in the name        
-        jobList = pbs_functions.getActiveJobs(user)
-        for (job, status) in jobList:
-            if text in job: # Matching job found so we keep waiting
-                stillWorking = True
-                # Print a message if this is the first time we saw the job as running
-                if (status == 'R') and (job not in jobsRunning):
-                    jobsRunning.append(job)
-                    print 'Job launched: ' + job
-
-def checkResults(run, batchListPath):
-    '''Return (numOutputs, numProduced, errorCount) to help validate our results'''
+def launchJobs(run, mode, options, logger):
+    '''Run a blend, ortho gen, or label job.'''
     
-    logger = logging.getLogger(__name__)
+    # TODO: Also merge with the logic for creating a camera file.
     
-    # TODO: Check more carefully!
+    logger.info('Running task ' + mode + ' for run ' + str(run))
+    
+    # Retrieve parallel processing parameters
+    (numProcesses, numThreads, tasksPerJob, maxHours) = getParallelParams(options.nodeType, mode)
+    
+    # Split the jobs across multiple nodes using frame ranges
+    numFrames = options.stopFrame - options.startFrame + 1
+    numJobs   = numFrames / tasksPerJob
+    if numJobs < 1:
+        numJobs = 1
+        
+    logger.info( ("Num frames: %d, tasks per job: %d, number of %s jobs: %d" %
+                  (numFrames, tasksPerJob, mode, numJobs) ) )
+    
+    outputFolder = run.getFolder()
+
+    scriptPath = ""
+    extraArgs  = ""
+    jobTag     = ""
+    priority   = 5
+    if mode == 'orthogen':
+        scriptPath = icebridge_common.fullPath('gen_ortho.py')
+        queueName  = ORTHOGEN_PBS_QUEUE
+        jobTag     = 'O'
+        extraArgs  = ' --bundle-length ' + str(options.bundleLength)
+    elif mode == 'blend':
+        scriptPath = icebridge_common.fullPath('blend_dems.py')
+        queueName  = BLEND_PBS_QUEUE
+        jobTag     = 'B'
+        extraArgs  = ' --blend-to-fireball-footprint --bundle-length ' + str(options.bundleLength)
+    elif mode == 'label':
+        scriptPath = icebridge_common.fullPath('label_images.py')
+        queueName  = LABEL_PBS_QUEUE
+        jobTag     = 'L'
+        priority   = 0 # Make these slightly lower priority than the other jobs.
+                       # May need to experiment with these numbers.
+        extraArgs  = ' --training ' + getLabelTrainingPath(icebridge_common.getUser())
+    else:
+        raise Exception("Unknown mode: " + mode)
+    args = (('--site %s --yyyymmdd %s --num-threads %d --num-processes %d ' + \
+            '--output-folder %s %s ') 
+            % (run.site, run.yyyymmdd, numThreads, numProcesses, outputFolder, extraArgs))
+    
+    baseName = run.shortName() # SITE + YYMMDD = 8 chars, leaves seven for frame digits.
+
+    # Get the location to store the logs    
+    pbsLogFolder = run.getPbsLogFolder()
+
+    # Submit all the jobs
+    jobNames = []
+    jobIds   = []
+    currentFrame = options.startFrame
+    for i in range(0, numJobs):
+        jobName    = ('%s%06d%s' % (jobTag, currentFrame, baseName) ) # 'B'lend or 'O'rtho
+        startFrame = currentFrame
+        stopFrame  = currentFrame+tasksPerJob # Last frame passed to the tool is not processed
+        if (i == numJobs - 1):
+            stopFrame = options.stopFrame # Make sure nothing is lost at the end
+        thisArgs = (args + ' --start-frame ' + str(startFrame) + ' --stop-frame ' + str(stopFrame) )
+        logPrefix = os.path.join(pbsLogFolder, mode + '_' + jobName)
+        logger.info('Submitting job: ' + scriptPath +  ' ' + thisArgs)
+        jobId = pbs_functions.submitJob(jobName, queueName, maxHours, logger,
+                                        options.minutesInDevelQueue, GROUP_ID,
+                                        options.nodeType, '/usr/bin/python2.7',
+                                        scriptPath + ' ' + thisArgs, logPrefix, priority)
+
+        jobNames.append(jobName)
+        jobIds.append(jobName)
+        currentFrame += tasksPerJob
+
+    return (baseName, jobNames, jobIds)
+
+def checkResultsForType(run, options, batchListPath, batchOutputName, logger):
+
+    numNominal  = 0
+    numProduced = 0
+
+    (minFrame, maxFrame) = run.getFrameRange()
+
+    with open(batchListPath, 'r') as f:
+        for line in f:
+
+            outputFolder = getOutputFolderFromBatchCommand(line)
+            (begFrame, endFrame) = icebridge_common.getFrameRangeFromBatchFolder(outputFolder)
+
+            if begFrame < options.startFrame:
+                continue
+            if begFrame >= options.stopFrame:
+                continue
+            
+            if begFrame >= maxFrame:
+                # This is necessary. For the last valid frame, there is never a DEM.
+                continue
+            
+            targetPath   = os.path.join(outputFolder, batchOutputName)
+            numNominal += 1
+            if os.path.exists(targetPath):
+                numProduced += 1
+            else:
+                logger.info('Did not find: ' + targetPath)
+                if not os.path.exists(outputFolder):
+                    logger.error('Check output folder position in batch log file!')
+
+    return (numNominal, numProduced)
+    
+def checkResults(run, options, logger, batchListPath):
+    
+    logger.info("Checking the results.")
+
+    # TODO: Some existing functionlity below can be integrated better.
+    
     runFolder = run.getFolder()
     
     packedErrorLog = os.path.join(runFolder, 'packedErrors.log')
@@ -360,7 +673,7 @@ def checkResults(run, batchListPath):
         logFileList = os.listdir(pbsLogFolder)
         logFileList = [os.path.join(pbsLogFolder, x) for x in logFileList]
         errorCount = 0
-        errorWords = ['but crn has'] # TODO: Add more!
+        errorWords = ['but crn has', 'LD_PRELOAD cannot be preloaded'] # TODO: Add more!
         for log in logFileList:
             with open(log, 'r') as f:
                 for line in f:
@@ -373,50 +686,116 @@ def checkResults(run, batchListPath):
                         errorLog.write(line)
                         errorCount += 1
     logger.info('Counted ' + str(errorCount) + ' errors in log files!')
+
+    # Produced DEMs
+    (numNominalDems, numProducedDems) = checkResultsForType(run, options,
+                                                            batchListPath,
+                                                            icebridge_common.blendFileName(),
+                                                            logger)
     
-    # Make sure each batch produced the aligned DEM file
-    batchOutputName = 'out-align-DEM.tif'
+    # Produced orthos
+    (numNominalOrthos, numProducedOrthos) = checkResultsForType(run, options,
+                                                                batchListPath,
+                                                                icebridge_common.orthoFileName(),
+                                                                logger)
+
+    resultText = ""
+    resultText += ('Created %d out of %d output DEMs. ' % 
+                   (numProducedDems, numNominalDems))
+    resultText += ('Created %d out of %d output ortho images. ' % 
+                   (numProducedOrthos, numNominalOrthos))
+    resultText += ('Detected %d errors. ' % 
+                   (errorCount))
+
+    # Load index of fireball DEMs for comparison
+    fireballDems = {}
+    try:
+        allFireballDems = icebridge_common.getCorrectedFireballDems(run.getFolder())
+        for frame in allFireballDems.keys():
+            if frame < options.startFrame or frame >= options.stopFrame:
+                continue
+            fireballDems[frame] = allFireballDems[frame]
+    except Exception, e:
+        # No fireball
+        logger.info(str(e))
+
+    numFireballDems = len(fireballDems.keys())
     
-    numOutputs  = 0
-    numProduced = 0
-    with open(batchListPath, 'r') as f:
-        for line in f:
-            parts        = line.split()
-            outputFolder = parts[9] # This needs to be kept up to date with the file format!
-            targetPath   = os.path.join(outputFolder, batchOutputName)
-            numOutputs += 1
-            if os.path.exists(targetPath):
-                numProduced += 1
-            else:
-                logger.info('Did not find: ' + targetPath)
-                if not os.path.exists(outputFolder):
-                    logger.error('Check output folder position in batch log file!')
-            
-    return (numOutputs, numProduced, errorCount)
+    alignedDems = run.existingFilesDict(icebridge_common.alignFileName(),
+                                        options.startFrame, options.stopFrame)
+    numAlignedDems = len(alignedDems.keys())
+    
+    blendedDems = run.existingFilesDict(icebridge_common.blendFileName(),
+                                        options.startFrame, options.stopFrame)
+    numBlendedDems = len(blendedDems.keys())
+    
+    orthos = run.existingFilesDict(icebridge_common.orthoFileName(),
+                                   options.startFrame, options.stopFrame)
+    numOrthos = len(orthos.keys())
+
+    numMissingBlended = 0
+    for frame in sorted(alignedDems.keys()):
+        if frame not in blendedDems.keys():
+            logger.info("Found aligned DEM but no blended DEM for frame: " + str(frame))
+            numMissingBlended += 1
+
+    numMissingOrthos = 0
+    for frame in sorted(blendedDems.keys()):
+        if frame not in orthos.keys():
+            logger.info("Found blended DEM but no ortho for frame: " + str(frame))
+            numMissingOrthos += 1
+
+    numMissingAligned = 0
+    for frame in sorted(fireballDems.keys()):
+        if not frame in blendedDems.keys():
+            logger.info("Found fireball DEM but no blended DEM for frame: " + str(frame))
+            numMissingAligned += 1
+
+    vals = ["Number of aligned DEMs: " + str(numAlignedDems),
+            "Number of blended DEMs: " + str(numBlendedDems),
+            "Number of ortho images: " + str(numOrthos),
+            "Number of fireball DEMs: " + str(numFireballDems),
+            "Aligned DEMs without blended DEMs: " + str(numMissingBlended),
+            "Blended DEMs without ortho images: " + str(numMissingOrthos),
+            "Fireball DEMs with no corresponding blended DEM: " + str(numMissingAligned)
+            ]
+    
+    resultText += "\n" + "\n".join(vals)
+
+    logger.info(resultText)
+    
+    runWasSuccess = False
+    if (numProducedDems == numNominalDems) and \
+           (numProducedOrthos == numNominalOrthos) and \
+           (errorCount == 0):
+        runWasSuccess =  True
+        
+    return (runWasSuccess, resultText)
 
 def checkRequiredTools():
     '''Verify that we have all the tools we will be calling during the script.'''
 
-    tools = ['full_processing_script.py',
-             'multi_process_command_runner.py',
-             'merge_orbitviz.py',
-             'process_icebridge_run.py',
-             'process_icebridge_batch.py',
-             'lvis2kml.py',
-             'ortho2pinhole',
-             'camera_footprint'
-            ]
-
+    scripts = ['full_processing_script.py',
+               'multi_process_command_runner.py',
+               'merge_orbitviz.py',
+               'process_icebridge_run.py',
+               'process_icebridge_batch.py',
+               'lvis2kml.py', 'blend_dems.py', 'gen_ortho.py']
+    tools  = ['ortho2pinhole', 'camera_footprint', 'bundle_adjust',
+              'stereo', 'point2dem', 'mapproject']
+    
     for tool in tools:
         asp_system_utils.checkIfToolExists(tool)
+
+    for script in scripts:
+        if not os.path.exists(icebridge_common.fullPath(script)):
+            raise Exception("Could not find: " + script)
 
 def main(argsIn):
 
     try:
         usage = '''usage: pleiades_manager.py <options> '''
         parser = argparse.ArgumentParser(usage=usage)
-
-        ## Run selection
 
         parser.add_argument("--base-dir",  dest="baseDir", default=os.getcwd(),
                             help="Where all the inputs and outputs are stored.")
@@ -430,8 +809,22 @@ def main(argsIn):
         parser.add_argument("--site",  dest="site", required=True,
                             help="Name of the location of the images (AN, GR, or AL)")
                             
-        parser.add_argument("--node-type",  dest="nodeType", default='ivy'
+        parser.add_argument("--node-type",  dest="nodeType", default='ivy',
                             help="Node type to use (wes[mfe], san, ivy, has, bro)")
+
+        # Debug option
+        parser.add_argument('--minutes-in-devel-queue', dest='minutesInDevelQueue', type=int,
+                            default=0,
+                            help="If positive, submit to the devel queue for this many minutes.")
+
+        parser.add_argument('--start-frame', dest='startFrame', type=int,
+                            default=icebridge_common.getSmallestFrame(),
+                            help="Frame to start with.  Leave this and stop-frame blank to " + \
+                            "process all frames.")
+        
+        parser.add_argument('--stop-frame', dest='stopFrame', type=int,
+                            default=icebridge_common.getLargestFrame(),
+                            help='Frame to stop on.')
         
         parser.add_argument("--camera-calibration-folder",  dest="inputCalFolder", default=None,
                           help="The folder containing camera calibration.")
@@ -441,20 +834,143 @@ def main(argsIn):
         parser.add_argument('--bundle-length', dest='bundleLength', default=2,
                           type=int, help="The number of images to bundle adjust and process in a single batch.")
 
-        parser.add_argument("--stop-before-process", action="store_true", dest="dontProcess", default=False, 
+        parser.add_argument("--recompute-batch-file", action="store_true", 
+                            dest="recomputeBatches", default=False, 
+                            help="Recompute an existing batch file.")
+
+        parser.add_argument("--no-refetch", action="store_true", 
+                            dest="noRefetch", default=False, 
+                            help="Do not attempt to refetch from NSIDC.")
+        
+        parser.add_argument("--no-refetch-index", action="store_true", 
+                            dest="noRefetchIndex", default=False, 
+                            help="Do not refetch the index from NSIDC.")
+
+        parser.add_argument("--skip-check-inputs", action="store_true", 
+                            dest="skipCheckInputs", default=False, 
+                            help="Skip checking if files exist. This can be very slow for many files.")
+
+        parser.add_argument("--skip-completed-batches", action="store_true", 
+                            dest="failedBatchesOnly", default=False, 
+                            help="Don't reprocess completed batches.")
+
+        parser.add_argument("--force-redo-these-frames",  dest="redoFrameList", default="",
+                          help="For each frame in this file (stored one per line) within the current frame range, delete the batch folder and redo the batch (only applies to batch processing).")
+
+        parser.add_argument("--use-tar", action="store_true", dest="useTar", default=False, 
+                            help="Fetch from lfe using tar instead of shift.")
+
+        parser.add_argument("--skip-fetch", action="store_true", dest="skipFetch", default=False, 
+                            help="Don't fetch.")
+
+        parser.add_argument("--skip-tape-fetch", action="store_true", dest="skipTapeFetch", default=False, 
+                            help="Don't fetch from tape, go directly to NSIDC. With this, one must not skip the convert step, as then subsequent steps will fail.")
+        
+        parser.add_argument("--force-tape-fetch", action="store_true", dest="forceTapeFetch", default=False, 
+                            help="Fetch from tape even if a partial run directory is alrady present.")
+        parser.add_argument("--skip-convert", action="store_true", dest="skipConvert",
+                            default=False, 
+                            help="Don't convert.")
+
+        parser.add_argument("--skip-archive-cameras", action="store_true",
+                            dest="skipArchiveCameras", default=False,
+                            help="Skip archiving the cameras.")
+
+        parser.add_argument("--skip-batch-gen", action="store_true",
+                            dest="skipBatchGen", default=False,
+                            help="Skip generating batches.")
+        
+        parser.add_argument("--skip-process", action="store_true",
+                            dest="skipProcess", default=False, 
                             help="Don't process the batches.")
-        parser.add_argument("--process-only", action="store_true", dest="processOnly", default=False, 
-                            help="Don't fetch or convert.")
+        
+        parser.add_argument("--skip-blend", action="store_true", dest="skipBlend", default=False, 
+                            help="Skip blending.")
+
+        parser.add_argument("--skip-ortho-gen", action="store_true", dest="skipOrthoGen",
+                            default=False, help="Skip ortho image generation.")
+
+        parser.add_argument("--skip-check-outputs", action="store_true", dest="skipCheckOutputs",
+                            default=False, 
+                            help="Skip checking the outputs.")
+
+        parser.add_argument("--skip-report", action="store_true", dest="skipReport",
+                            default=False, 
+                            help="Skip invoking the flight summary tool.")
+
+        parser.add_argument("--skip-kml", action="store_true", dest="skipKml", default=False, 
+                            help="Skip kml gen when doing a flight summary report.")
+
+        parser.add_argument("--skip-archive-aligned-cameras", action="store_true",
+                            dest="skipArchiveAlignedCameras", default=False,
+                            help="Skip archiving the aligned cameras.")
+
+        parser.add_argument("--skip-archive-orthos", action="store_true",
+                            dest="skipArchiveOrthos", default=False,
+                            help="Skip archiving the generated ortho images.")
+
+        parser.add_argument("--skip-archive-summary", action="store_true",
+                            dest="skipArchiveSummary", default=False,
+                            help="Skip archiving the summary.")
+
+        parser.add_argument("--skip-archive-run", action="store_true",
+                            dest="skipArchiveRun", default=False,
+                            help="Skip archiving the DEMs.")
+
+        parser.add_argument("--skip-cleanup", action="store_true",
+                            dest="skipCleanup", default=False, 
+                            help="Don't cleanup extra files from a run.")
+
+        parser.add_argument("--skip-email", action="store_true", 
+                            dest="skipEmail", default=False, 
+                            help="Don't send email.")
+
+        parser.add_argument("--no-nav", action="store_true", dest="noNavFetch",
+                            default=False, help="Don't fetch or convert the nav data.")
+
+        parser.add_argument("--simple-cameras", action="store_true", dest="simpleCameras",
+                            default=False, help="Don't use ortho images to refine camera models.")
+        
+        parser.add_argument("--skip-validate", action="store_true", dest="skipValidate",
+                            default=False, help="Don't validate the input data.")
+
+        parser.add_argument("--no-parallel-validate", action="store_false", dest="parallelValidate",
+                            default=True, help="Validate in parallel, during conversion.")
+        
+        parser.add_argument("--wipe-processed", action="store_true", dest="wipeProcessed",
+                            default=False,
+                            help="Wipe the processed folder.")
+
+        parser.add_argument("--wipe-all", action="store_true", dest="wipeAll", default=False,
+                            help="Wipe completely the directory, including the inputs.")
+
+        parser.add_argument("--generate-labels", action="store_true",
+                            dest="generateLabels", default=False,
+                            help="Run python label creation script on input jpegs.  Only for sea ice flights!")
+
+        parser.add_argument("--archive-labels", action="store_true",
+                            dest="archiveLabels", default=False,
+                            help="Archive the results from --generate-labels.")
                           
         options = parser.parse_args(argsIn)
 
     except argparse.ArgumentError, msg:
         parser.error(msg)
 
+
+    # Check if we are on the right machine
+    (host, err, status) = asp_system_utils.executeCommand(['uname', '-n'],
+                                                         suppressOutput = True)
+    host = host.strip()
+    if 'pfe' in host and options.nodeType not in PFE_NODES:
+        raise Exception("From machine " + host + " can only launch on: " + " ".join(PFE_NODES)) 
+    if 'mfe' in host and options.nodeType != 'wes':
+        raise Exception("From machine " + host + " can only launch on: wes")
+    
     #ALL_RUN_LIST       = os.path.join(options.baseDir, 'full_run_list.txt')
     #SKIP_RUN_LIST      = os.path.join(options.baseDir, 'run_skip_list.txt')
     #COMPLETED_RUN_LIST = os.path.join(options.baseDir, 'completed_run_list.txt')
-    
+
     options.logFolder = os.path.join(options.baseDir, 'manager_logs')
     os.system('mkdir -p ' + options.logFolder)
 
@@ -462,17 +978,7 @@ def main(argsIn):
         options.unpackDir = os.path.join(options.baseDir, 'data')
         
     os.system('mkdir -p ' + options.unpackDir)
-
-    options.summaryFolder = os.path.join(options.baseDir, 'summaries')
-    os.system('mkdir -p ' + options.summaryFolder)
     
-    logLevel = logging.INFO
-    logger   = icebridge_common.setUpLogger(options.logFolder, logLevel, 'pleiades_manager_log')
-
-    checkRequiredTools() # Make sure all the needed tools can be found before we start
-
-    emailAddress = getEmailAddress(getUser())
-
     # TODO: Uncomment when processing more than one run!
     # Get the list of runs to process
     #logger.info('Reading run lists...')
@@ -481,87 +987,226 @@ def main(argsIn):
     #doneRuns = readRunList(COMPLETED_RUN_LIST, options)
     #runList  = getRunsToProcess(allRuns, skipRuns, doneRuns)
 
-    runList = [run_helper.RunHelper(options.site, options.yyyymmdd, options.unpackDir)]
-   
-    # TODO: Loop is unused, this tool will be replaced by a different one
-    # Loop through the incomplete runs
-    for run in runList:
+    run = run_helper.RunHelper(options.site, options.yyyymmdd, options.unpackDir)
+    
+    summaryFolder = run.getSummaryFolder()
+    
+    logLevel = logging.INFO
+    logger   = icebridge_common.setUpLogger(options.logFolder, logLevel,
+                                            'pleiades_manager_log_' + str(run))
+
+    checkRequiredTools() # Make sure all the needed tools can be found before we start
+
+    logger.info("Disabling core dumps.") # these just take a lot of room
+    os.system("ulimit -c 0")
+    os.system("umask 022") # enforce files be readable by others
+
+    # See how many hours we used so far. I think this counter gets updated once a day.
+    (out, err, status) = asp_system_utils.executeCommand("acct_ytd", outputPath = None, 
+                                                         suppressOutput = True, redo = True,
+                                                         noThrow = True)
+    logger.info("Hours used so far:\n" + out + '\n' + err)
+  
+    if True:
+
+        # WARNNING: Below we tweak options.startFrame and options.stopFrame.
+        # If a loop over runs is implemeneted, things will break!
 
         # TODO: Put this in a try/except block so it keeps going on error
 
         # TODO: Prefetch the next run while waiting on this run!
 
-        batchListPath = os.path.join(run.getProcessFolder(), 'batch_commands_log.txt')
-
-        if not options.processOnly:
+        if not options.skipFetch:
             # Obtain the data for a run if it is not already done
-            runFetch(run, options)       
-                   
-            # Run conversion and archive results if not already done        
-            runConversion(run, options)
+            start_time()
+            runFetch(run, options, logger)       
+            stop_time("fetch", logger)
 
-            # Run command to generate the list of batch jobs for this run
-            logger.info('Fetching batch list for run ' + str(run))
-            batchListPath = generateBatchList(run, options, batchListPath)
-        else:
-            logger.info('Skipping fetch and ortho2pinhole')
+        # This must happen after fetch, otherwise fetch gets confused.
+        # Get the location to store the logs    
+        pbsLogFolder = run.getPbsLogFolder()
+        logger.info("Storing logs in: " + pbsLogFolder)
+        os.system('mkdir -p ' + pbsLogFolder)
+    
+        # Narrow the frame range. Note that if we really are at the last
+        # existing frame, we increment 1, to make sure we never miss anything.
+        
+        (minFrame, maxFrame) = run.getFrameRange()
+        if options.startFrame < minFrame:
+            options.startFrame = minFrame
+        if options.stopFrame >= maxFrame:
+            options.stopFrame = maxFrame + 1 # see above
+        logger.info('Detected frame range: ' + str((options.startFrame, options.stopFrame)))
 
-        if options.dontProcess:
-            logger.info('Quitting after pre-processing')
-            return
-       
-        # Divide up batches into jobs and submit them to machines.
-        logger.info('Submitting jobs for run ' + str(run))
-        baseName = submitBatchJobs(run, options, batchListPath)
+        if not options.skipConvert:                   
+            # Run initial camera generation
+            start_time()
+            conversionAttempt = 0
+            runConversion(run, options, conversionAttempt, logger)
+            stop_time("convert", logger)
+            
+        # I see no reason to exit early
+        #if options.skipProcess and options.skipBlend and options.skipReport and \
+        #       (not options.recomputeBatches) and options.skipArchiveCameras:
+        #    logger.info('Quitting early.')
+        #    return 0
+
+        fullBatchListPath = os.path.join(run.getProcessFolder(), 'batch_commands_log.txt')
+        batchListPath = fullBatchListPath
+
+        if not options.skipBatchGen:
+            start_time()
+            if os.path.exists(fullBatchListPath) and not options.recomputeBatches:
+                logger.info('Re-using existing batch list file.')
+            else:
+                # Run command to generate the list of batch jobs for this run
+                logger.info('Fetching batch list for run ' + str(run))
+                generateBatchList(run, options, fullBatchListPath, logger)
+
+            if options.failedBatchesOnly:
+                logger.info('Assembling batch file with only failed batches...')
+                batchListPath = filterBatchJobFile(run, batchListPath, logger)
+            stop_time("batch gen", logger)
+
+        if not options.skipProcess:
+            start_time()
+            # Divide up batches into jobs and submit them to machines.
+            logger.info('Submitting jobs for run ' + str(run))
+            (baseName, jobList) = submitBatchJobs(run, options, batchListPath, logger)
+
+            # Wait for all the jobs to finish
+            logger.info('Waiting for job completion of run ' + str(run))
+            
+            pbs_functions.waitForJobCompletion(jobList, logger, baseName)
+            logger.info('All jobs finished for run '+str(run))
+            stop_time("dem creation", logger)
+
+        labelJobNames = None
+        if options.generateLabels:
+            (baseName, labelJobNames, labelJobIds) = launchJobs(run, 'label', options, logger)
+            # Go ahead and launch the other jobs while these are in the queue
+
+        if not options.skipBlend:
+            start_time()
+            (baseName, jobNames, jobIds) = launchJobs(run, 'blend', options, logger)
+            pbs_functions.waitForJobCompletion(jobNames, logger, baseName)
+            stop_time("blend", logger)
         
-        
-        # Wait for all the jobs to finish
-        logger.info('Waiting for job completion of run ' + str(run))
-        waitForRunCompletion(baseName)
-        logger.info('All jobs finished for run '+str(run))
-        
+        if not options.skipOrthoGen:
+            start_time()
+            (baseName, jobNames, jobIds) = launchJobs(run, 'orthogen', options, logger)
+            pbs_functions.waitForJobCompletion(jobNames, logger, baseName)
+            stop_time("orthogen", logger)
+
+        if labelJobNames: # Now wait for any label jobs to finish.
+            pbs_functions.waitForJobCompletion(labelJobNames, logger, baseName)
+
         # TODO: Uncomment when processing multiple runs.
         ## Log the run as completed
         ## - If the run was not processed correctly it will have to be looked at manually
         #addToRunList(COMPLETED_RUN_LIST, run)
 
-        # Generate a simple report of the results
-        (numOutputs, numProduced, errorCount) = checkResults(run, batchListPath)
-        resultText = ('"Created %d out of %d output targets with %d errors."' % 
-                      (numProduced, numOutputs, errorCount))
-        logger.info(resultText)
+        # Pack up camera folder and store it for later.
+        if not options.skipArchiveCameras:
+            start_time()
+            try:
+                archive_functions.packAndSendCameraFolder(run, logger)
+            except Exception, e:
+                print 'Caught exception sending camera folder'
+                logger.exception(e)
+            stop_time("archive cameras", logger)
 
-        # Generate a summary folder and send a copy to Lou
-        # - Currently the summary folders need to be deleted manually, but they should not
-        #   take up much space due to the large amount of compression used.
-        summaryFolder = os.path.join(options.summaryFolder, run.name())
-        generate_flight_summary.generateFlightSummary(run, summaryFolder)
-        archive_functions.packAndSendSummaryFolder(run, summaryFolder) # Sends data to Lunokhod2 location
+        # Pack up the aligned cameras and store them for later
+        if not options.skipArchiveAlignedCameras:
+            start_time()
+            try:
+                archive_functions.packAndSendAlignedCameras(run, logger)
+            except Exception, e:
+                print 'Caught exception sending aligned cameras'
+                logger.exception(e)
+            stop_time("archive aligned cameras", logger)
 
-        # Don't pack or clean up the run if it did not generate all the output files.
-        if (numProduced == numOutputs) and (errorCount == 0):
-            print 'TODO: Automatically send the completed files to lou and clean up the run!'
-
-            # TODO: Uncomment this once our outputs are good.
-            # Pack up all the files to lou, then delete the local copies.          
-            #archive_functions.packAndSendCompletedRun(run)
-            #cleanupRun(run) # <-- Should this always be manual??
-            
-            # TODO: Don't wait on the pack/send operation to finish!
-            
-            sendEmail(emailAddress, '"IB run passed - '+str(run)+'"', resultText)
-        else:
-            sendEmail(emailAddress, '"IB run failed - '+str(run)+'"', resultText)
+        runWasSuccess = True
+        resultText = 'Summary skipped'
         
-        raise Exception('DEBUG - END LOOP')
-        
-    # End loop through runs
-    logger.info('==== pleiades_manager script has finished! ====')
+        if not options.skipCheckOutputs:
+            start_time()
+            # Generate a simple report of the results
+            (runWasSuccess, resultText) = checkResults(run, options, logger, fullBatchListPath)
+            stop_time("check outputs", logger)
+            
+        if not options.skipReport:
+            start_time()
+            # Generate a summary folder and send a copy to Lou
+            os.system('mkdir -p ' + summaryFolder)
+            genCmd = ['--yyyymmdd', run.yyyymmdd, '--site', run.site, 
+                      '--output-folder', summaryFolder, '--parent-folder', run.parentFolder]
+
+            if ((options.startFrame != icebridge_common.getSmallestFrame()) and
+                (options.stopFrame  != icebridge_common.getLargestFrame() ) ):
+                genCmd += ['--start-frame', str(options.startFrame),
+                           '--stop-frame',  str(options.stopFrame )]
+            if options.skipKml:
+                genCmd += ['--skip-kml']
+                
+            logger.info("Running generate_flight_summary.py " + " ".join(genCmd))
+            try:
+                generate_flight_summary.main(genCmd)
+            except Exception, e:
+                # Do not let this one ruin the day, if anything we can run it later
+                logger.info(str(e))
+            stop_time("report", logger)
+            
+        # send data to lunokhod and lfe
+        if not options.skipArchiveSummary:
+            start_time()
+            archive_functions.packAndSendSummaryFolder(run, summaryFolder, logger)
+            stop_time("archive summary", logger)
+            
+        # Archive the DEMs
+        if not options.skipArchiveRun:
+            start_time()
+            archive_functions.packAndSendCompletedRun(run, logger)
+            stop_time("archive dems", logger)
+            
+        # Pack up the generated ortho images and store them for later
+        if not options.skipArchiveOrthos:
+            start_time()
+            try:
+                archive_functions.packAndSendOrthos(run, logger)
+            except Exception, e:
+                print 'Caught exception sending ortho images.'
+                logger.exception(e)
+            stop_time("archive orthos", logger)
+
+        # Archive the label files
+        if options.archiveLabels:
+            start_time()
+            archive_functions.packAndSendLabels(run, logger)
+            stop_time("archive labels", logger)
+
+        if not options.skipEmail:
+            emailAddress = getEmailAddress(icebridge_common.getUser())
+            logger.info("Sending email to: " + emailAddress)
+            if runWasSuccess:
+                sendEmail(emailAddress, 'OIB run passed - ' + str(run), resultText)
+            else:
+                sendEmail(emailAddress, '"OIB run failed - ' + str(run), resultText)
+
+        if options.wipeProcessed:
+            processedFolder = run.getProcessFolder()
+            logger.info("Will delete: " + processedFolder)
+            os.system("rm -rf " + processedFolder)
+            
+        if options.wipeAll:
+            outFolder = run.getFolder()
+            logger.info("Will delete: " + outFolder)
+            os.system("rm -rf " + outFolder)
+            
+        #raise Exception('DEBUG - END LOOP')
+        logger.info('==== pleiades_manager script has finished for run: ' + str(run) + ' ====')
 
 
 # Run main function if file used from shell
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
-
-
-

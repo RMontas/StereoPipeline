@@ -69,21 +69,198 @@ int g_ba_num_errors = 0;
 Mutex g_ba_mutex;
 
 
+
+//==================================================================================
+// IP filtering functions -> Move them somewhere else once they are settled
+
+/// Filter IP points by how reasonably the disparity can change along rows
+size_t filter_ip_homog(std::vector<ip::InterestPoint> const& ip1_in,
+                       std::vector<ip::InterestPoint> const& ip2_in,
+                       std::vector<ip::InterestPoint>      & ip1_out,
+                       std::vector<ip::InterestPoint>      & ip2_out,
+                       int inlier_threshold = 1) {
+
+  std::vector<size_t> indices;
+  try {
+  
+    std::vector<Vector3> ransac_ip1 = iplist_to_vectorlist(ip1_in),
+                         ransac_ip2 = iplist_to_vectorlist(ip2_in);
+  
+    typedef math::RandomSampleConsensus<math::HomographyFittingFunctor, math::InterestPointErrorMetric> RansacT;
+    const int    MIN_NUM_OUTPUT_INLIERS = ransac_ip1.size()/2;
+    const int    NUM_ITERATIONS         = 100;
+    RansacT ransac( math::HomographyFittingFunctor(),
+                    math::InterestPointErrorMetric(), NUM_ITERATIONS,
+                    inlier_threshold,
+                    MIN_NUM_OUTPUT_INLIERS, true
+                  );
+    Matrix<double> H(ransac(ransac_ip2,ransac_ip1)); // 2 then 1 is used here for legacy reasons
+    vw_out() << "\t--> Homography: " << H << "\n";
+    indices = ransac.inlier_indices(H,ransac_ip2,ransac_ip1);
+  } catch (const math::RANSACErr& e ) {
+    vw_out() << "RANSAC Failed: " << e.what() << "\n";
+    return false;
+  }
+
+  // Assemble the remaining interest points
+  const size_t num_left = indices.size();
+  std::vector<ip::InterestPoint> final_ip1, final_ip2;
+  ip1_out.resize(num_left);
+  ip2_out.resize(num_left);
+  for (size_t i=0; i<num_left; ++i) {
+    size_t index = indices[i];
+    ip1_out[i] = ip1_in[index];
+    ip2_out[i] = ip2_in[index];
+  }
+
+  return num_left;
+}
+
+// IP pair sorting functions
+typedef std::pair<ip::InterestPoint, ip::InterestPoint> IpPair;
+
+bool comp_ip_col(IpPair const& a, IpPair const& b) {
+  if (a.first.x == b.first.x)
+    return a.first.y < b.first.y;
+  return a.first.x < b.first.x;
+}
+bool comp_ip_row(IpPair const& a, IpPair const& b) {
+  if (a.first.y == b.first.y)
+    return a.first.x < b.first.x;
+  return a.first.y < b.first.y;
+}
+
+/// Filter IP points by how reasonably the disparity can change along rows
+size_t filter_ip_sides(std::vector<ip::InterestPoint> const& ip1_in,
+                       std::vector<ip::InterestPoint> const& ip2_in,
+                       std::vector<ip::InterestPoint>      & ip1_out,
+                       std::vector<ip::InterestPoint>      & ip2_out,
+                       int image_width1, int image_width2,
+                       int side_percentage = 20) {
+
+  const size_t num_pairs_in = ip1_in.size();
+  /*
+  // Create list of IP pairs sorted by column 1 (low to high)
+  std::vector<IpPair> ip_pairs_in(num_pairs_in);
+  for (size_t i=0; i<num_pairs_in; ++i) {
+    ip_pairs_in[i].first  = ip1_in[i];
+    ip_pairs_in[i].second = ip2_in[i];
+  }
+  std::sort(ip_pairs_in.begin(), ip_pairs_in.end(), comp_ip_col);
+
+  // Get disparities for each pair
+  std::vector<double> dx(num_pairs_in);
+  for (size_t i=0; i<num_pairs_in; ++i) {
+    dx[i] = ip_pairs_in[i].second.x - ip_pairs_in[i].first.x;
+    std::cout << dx[i] << std::endl;
+  }
+  */
+  
+  // TODO: Automatically calculate what counts as the "side"
+  // Filter out IP too close to the sides
+  
+  double crop_percent = static_cast<double>(side_percentage) / 100.0;
+  vw_out() << "Removing IP within " << crop_percent << " percent of the outer left/right sides of the images.\n";
+  int crop_size1 = image_width1 * crop_percent;
+  int crop_size2 = image_width1 * crop_percent;
+  
+  ip1_out.clear();
+  ip2_out.clear();
+  double kept_mean = 0, reject_mean = 0;
+  for (size_t i=0; i<num_pairs_in; ++i) {
+    bool   keep = ((ip1_in[i].x >= crop_size1) && ((image_width2 - ip2_in[i].x) > crop_size2));
+    double disp = ip2_in[i].x - ip1_in[i].x;
+    if (keep) {
+      ip1_out.push_back(ip1_in[i]);
+      ip2_out.push_back(ip2_in[i]);
+      kept_mean += disp;
+    }
+    else {
+      reject_mean += disp;
+    }
+  }
+  size_t num_left     = ip1_out.size();
+  size_t num_rejected = num_pairs_in - num_left;
+  
+  if (num_left > 0) {
+    kept_mean /= static_cast<double>(num_left);
+    vw_out() << "Mean disparity of points kept by side disparity = " << kept_mean << std::endl;
+  }
+  if (num_rejected > 0) {
+    reject_mean /= static_cast<double>(num_rejected);
+    vw_out() << "Mean disparity of points rejected by side disparity = " << reject_mean << std::endl;
+  }
+  
+  return num_left;
+}
+
+
+double calc_ip_coverage_fraction(std::vector<ip::InterestPoint> const& ip,
+                                 Vector2i const& image_size, int tile_size=1024) {
+
+  if (tile_size < 1)
+    vw_throw(LogicErr() << "calc_ip_coverage_fraction: tile size is " << tile_size);
+
+  // Generate a grid of ROIs covering the entire image
+  BBox2i full_bbox(Vector2i(0,0), image_size);
+  bool include_partials = false;
+  std::vector<BBox2i> rois;
+  rois = subdivide_bbox(full_bbox, tile_size, tile_size, include_partials);
+  const size_t num_rois = rois.size();
+  if (num_rois == 0)
+    return 0; // Can't have any coverage in the degenerate case!
+  
+  // Pack all IP into a list for speed
+  std::list<Vector2i> ip_list;
+  for (size_t i=0; i<ip.size(); ++i) {
+    ip_list.push_back(Vector2i(ip[i].x, ip[i].y));
+  }
+  
+  // Count up the pecentage of ROIs which have at least this many IP.
+  const int MIN_ROI_IP = 2;
+  
+  size_t num_filled_rois = 0;
+  for (size_t i=0; i<num_rois; ++i) { // Loop through ROIs
+    int ip_in_roi = 0;
+    
+    // Check if each point is in this ROI
+    std::list<Vector2i>::iterator iter;
+    for (iter=ip_list.begin(); iter!=ip_list.end(); ++iter) {
+      
+      // If the IP is in the ROI, remove it from the IP list so it
+      // does not get searched again.
+      if (rois[i].contains(*iter)) {
+        iter = ip_list.erase(iter);
+        ++ip_in_roi;
+        --iter;
+      }
+    } // End IP loop
+    if (ip_in_roi > MIN_ROI_IP)
+      ++num_filled_rois;
+  }// End ROI loop
+
+  return static_cast<double>(num_filled_rois) / static_cast<double>(num_rois);
+}
+
+//==================================================================================
+
+
 struct Options : public vw::cartography::GdalWriteOptions {
   std::vector<std::string> image_files, camera_files, gcp_files;
   std::string cnet_file, out_prefix, stereo_session_string,
     cost_function, ba_type, mapprojected_data, gcp_data;
-  int    ip_per_tile;
+  int    ip_per_tile, ip_edge_buffer_percent;
   double min_triangulation_angle, lambda, camera_weight, rotation_weight, 
          translation_weight, overlap_exponent, robust_threshold;
   int    report_level, min_matches, max_iterations, overlap_limit;
-  bool   save_iteration, local_pinhole_input, fix_gcp_xyz, solve_intrinsics;
+  bool   save_iteration, local_pinhole_input, fix_gcp_xyz, solve_intrinsics,
+         disable_tri_filtering, ip_normalize_tiles, ip_debug_images;
   std::string datum_str, camera_position_file, initial_transform_file,
     csv_format_str, csv_proj4_str, intrinsics_to_float_str;
   double semi_major, semi_minor, position_filter_dist;
   int num_ba_passes;
   std::string remove_outliers_params_str;
-  Vector3 remove_outliers_params;
+  vw::Vector<double, 4> remove_outliers_params;
 
   boost::shared_ptr<ControlNetwork> cnet;
   std::vector<boost::shared_ptr<CameraModel> > camera_models;
@@ -91,7 +268,7 @@ struct Options : public vw::cartography::GdalWriteOptions {
   int    ip_detect_method, num_scales;
   double epipolar_threshold; // Max distance from epipolar line to search for IP matches.
   double ip_inlier_factor, ip_uniqueness_thresh, nodata_value;
-  bool   skip_rough_homography, individually_normalize;
+  bool   skip_rough_homography, individually_normalize, use_llh_error;
   vw::Vector2  elevation_limit;     // Expected range of elevation to limit results to.
   vw::BBox2    lon_lat_limit;       // Limit the triangulated interest points to this lonlat range
   std::set<std::string> intrinsics_to_float;
@@ -111,7 +288,7 @@ struct Options : public vw::cartography::GdalWriteOptions {
              datum(cartography::Datum(UNSPECIFIED_DATUM, "User Specified Spheroid",
                                       "Reference Meridian", 1, 1, 0)),
              ip_detect_method(0), num_scales(-1), skip_rough_homography(false),
-             individually_normalize(false){}
+             individually_normalize(false), use_llh_error(false){}
 };
 
 // TODO: This update stuff should really be done somewhere else!
@@ -435,6 +612,50 @@ struct XYZError {
 };
 
 /// A ceres cost function. The residual is the difference between the
+/// observed 3D point lon-lat-height, and the current (floating) 3D
+/// point lon-lat-height, normalized by sigma. Used only for
+/// ground control points. This has the advantage, unlike
+/// XYZError, that when the height is not known reliably,
+/// but lon-lat is, we can, in the GCP file, assign a bigger
+/// sigma to the latter.
+struct LLHError {
+  LLHError(Vector3 const& observation_xyz, Vector3 const& sigma, vw::cartography::Datum & datum):
+    m_observation_xyz(observation_xyz), m_sigma(sigma), m_datum(datum){}
+
+  template <typename T>
+  bool operator()(const T* point, T* residuals) const {
+    Vector3 observation_llh, point_xyz, point_llh;
+    for (size_t p = 0; p < m_observation_xyz.size(); p++) {
+      point_xyz[p] = double(point[p]);
+    }
+
+    point_llh       = m_datum.cartesian_to_geodetic(point_xyz);
+    observation_llh = m_datum.cartesian_to_geodetic(m_observation_xyz);
+
+    for (size_t p = 0; p < m_observation_xyz.size(); p++) 
+      residuals[p] = (point_llh[p] - observation_llh[p])/m_sigma[p]; // Input units are meters
+    
+    return true;
+  }
+
+  // Factory to hide the construction of the CostFunction object from
+  // the client code.
+  static ceres::CostFunction* Create(Vector3 const& observation_xyz,
+                                     Vector3 const& sigma,
+                                     vw::cartography::Datum & datum){
+
+    return (new ceres::NumericDiffCostFunction<LLHError, ceres::CENTRAL, 3, 3>
+            (new LLHError(observation_xyz, sigma, datum)));
+    
+  }
+  
+  Vector3 m_observation_xyz;
+  Vector3 m_sigma;
+  vw::cartography::Datum m_datum;
+};
+
+
+/// A ceres cost function. The residual is the difference between the
 /// original camera center and the current (floating) camera center.
 /// This cost function prevents the cameras from straying too far from
 /// their starting point.
@@ -671,7 +892,7 @@ void compute_mean_residuals_at_xyz(CameraRelationNetwork<JFeature> & crn,
   } // End double loop through all the observations
 
   // Do the averaging
-  for (size_t i=0; i<num_points; ++i) {
+  for (size_t i = 0; i < num_points; ++i) {
     if (outlier_xyz.find(i) != outlier_xyz.end()) {
       // Skip outliers. But initialize to something.
       mean_residuals[i] = std::numeric_limits<double>::quiet_NaN();
@@ -702,13 +923,15 @@ void write_residual_map(std::string const& output_prefix, CameraRelationNetwork<
   
   // Open the output file and write the header
   std::string output_path = output_prefix + "_point_log.csv";
+  vw_out() << "Writing: " << output_path << std::endl;
+  
   std::ofstream file;
   file.open(output_path.c_str());
   file << "lon, lat, alt, mean_residual, num_observations\n";
   file.precision(18);
   
   // Now write all the points to the file
-  for (size_t i=0; i<num_points; ++i) {
+  for (size_t i = 0; i < num_points; ++i) {
 
     if (outlier_xyz.find(i) != outlier_xyz.end()) continue; // skip outliers
     
@@ -788,6 +1011,11 @@ void write_residual_logs(std::string const& residual_prefix, bool apply_loss_fun
   // Write a report on residual errors
   std::ofstream residual_file, residual_file_raw_pixels, residual_file_raw_gcp,
     residual_file_raw_cams;
+  vw_out() << "Writing: " << residual_path << std::endl;
+  vw_out() << "Writing: " << residual_raw_pixels_path << std::endl;
+  vw_out() << "Writing: " << residual_raw_gcp_path << std::endl;
+  vw_out() << "Writing: " << residual_raw_cams_path << std::endl;
+  
   residual_file.open(residual_path.c_str());
   residual_file_raw_pixels.open(residual_raw_pixels_path.c_str());
   residual_file_raw_cams.open(residual_raw_cams_path.c_str());
@@ -876,16 +1104,18 @@ void write_residual_logs(std::string const& residual_prefix, bool apply_loss_fun
 } // End function write_residual_logs
 
 /// Add to the outliers based on the large residuals
-void update_outliers(ControlNetwork                  & cnet,
-                     CameraRelationNetwork<JFeature> & crn,
-                     const double *points, const size_t num_points,
-                     std::set<int> & outlier_xyz,
-                     Options const& opt,
-                     size_t num_cameras,
-                     size_t num_camera_params, size_t num_point_params,
-                     std::vector<size_t> const& cam_residual_counts,
-                     size_t num_gcp_residuals, 
-                     ceres::Problem &problem) {
+int update_outliers(ControlNetwork                  & cnet,
+                    CameraRelationNetwork<JFeature> & crn,
+                    const double *points, const size_t num_points,
+                    std::set<int> & outlier_xyz,
+                    Options const& opt,
+                    size_t num_cameras,
+                    size_t num_camera_params, size_t num_point_params,
+                    std::vector<size_t> const& cam_residual_counts,
+                    size_t num_gcp_residuals, 
+                    ceres::Problem &problem) {
+  
+  vw_out() << "Removing pixel outliers in preparation for another solver attempt.\n";
 
   // Compute the reprojection error. Hence we should not add the contribution
   // of the loss function.
@@ -895,21 +1125,20 @@ void update_outliers(ControlNetwork                  & cnet,
                     opt, num_cameras, num_camera_params, num_point_params,  cam_residual_counts,  
                     num_gcp_residuals,  crn, problem,
                     residuals // output
-                    );
+                   );
 
   // Compute the mean residual at each xyz, and how many times that residual is seen
   std::vector<double> mean_residuals;
   std::vector<int>  num_point_observations;
   compute_mean_residuals_at_xyz(crn,  residuals,  num_points, outlier_xyz,  num_cameras,
-				// outputs
-				mean_residuals, num_point_observations);
+                                // outputs
+                                mean_residuals, num_point_observations);
 
 
   // The number of mean residuals is the same as the number of points,
   // of which some are outliers. Hence need to collect only the
   // non-outliers so far to be able to remove new outliers.  Need to
-  // follow the same logic as when residuals were formed. And also
-  // ignore GCP.
+  // follow the same logic as when residuals were formed. And also ignore GCP.
   std::vector<double> actual_residuals;
   std::set<int> was_added;
   for ( size_t icam = 0; icam < num_cameras; icam++ ) {
@@ -931,20 +1160,24 @@ void update_outliers(ControlNetwork                  & cnet,
       
       was_added.insert(ipt);
       actual_residuals.push_back(mean_residuals[ipt]);
+      //vw_out() << "XYZ residual " << ipt << " = " << mean_residuals[ipt] << std::endl;
     }
   } // End double loop through all the observations
 
-  double pct = 1.0 - opt.remove_outliers_params[0]/100.0;
+  double pct            = 1.0 - opt.remove_outliers_params[0]/100.0;
   double outlier_factor = opt.remove_outliers_params[1];
-  double max_pix =  opt.remove_outliers_params[2];
+  double max_pix1 =  opt.remove_outliers_params[2];
+  double max_pix2 =  opt.remove_outliers_params[3];
 
   double b, e; 
   vw::math::find_outlier_brackets(actual_residuals, pct, outlier_factor, b, e);
+  vw_out() << "Outlier statistics: b = " << b << ", e = " << e << ".\n";
   
   // If this is too aggressive, the user can tame it. It is
   // unreasonable to throw out pixel residuals as small as 1 or 2
   // pixels.  We will not use the b, because the residuals start at 0.
-  e = std::max(e, max_pix);
+  // - "max_pix" sets the minimum error that can be thrown out.
+  e = std::min(std::max(e, max_pix1), max_pix2);
 
   vw_out() << "Removing as outliers points with mean reprojection error > " << e << ".\n";
   
@@ -964,18 +1197,20 @@ void update_outliers(ControlNetwork                  & cnet,
       if (cnet[ipt].type() == ControlPoint::GroundControlPoint) continue;
 
       if (mean_residuals[ipt] > e) {
+        //vw_out() << "Removing " << ipt << " with residual " << mean_residuals[ipt] << std::endl;
         new_outliers.insert(ipt);
       }
 
       const double * point = points + ipt * num_point_params;
       Vector3 xyz(point[0], point[1], point[2]);
       Vector3 llh = opt.datum.cartesian_to_geodetic(xyz);
-  
+  /*
       // Also filter by elevation limit
       if ( (asp::stereo_settings().elevation_limit[0] <
             asp::stereo_settings().elevation_limit[1]) && 
-	   ( (llh[2] < asp::stereo_settings().elevation_limit[0]) ||
+	           ( (llh[2] < asp::stereo_settings().elevation_limit[0]) ||
              (llh[2] > asp::stereo_settings().elevation_limit[1]) ) ) {
+        vw_out() << "Removing " << ipt << " with elevation " << llh[2] << std::endl;
         new_outliers.insert(ipt); 
       }
 
@@ -983,15 +1218,23 @@ void update_outliers(ControlNetwork                  & cnet,
       Vector2 lon_lat = subvector(llh, 0, 2);
       if ( (!asp::stereo_settings().lon_lat_limit.empty()) &&
            (!asp::stereo_settings().lon_lat_limit.contains(lon_lat)) ) {
+        vw_out() << "Removing " << ipt << " with lonlat " << lon_lat << std::endl;
         new_outliers.insert(ipt); 
-      }
+      }*/
     }
   } // End double loop through all the observations
 
-  vw_out() << "Added " << new_outliers.size() - outlier_xyz.size() << " outliers.\n";
+  int num_new_outliers     = new_outliers.size() - outlier_xyz.size();
+  int num_remaining_points = num_points - new_outliers.size();
+  vw_out() << "Removed " << num_new_outliers << " outliers, now have "
+           << num_remaining_points << " points remaining\n";
+
+  // TODO: Write how many outliers were removed because of the lonlat check and elevation check
   
   // Overwrite the outliers
   outlier_xyz = new_outliers;
+
+  return num_new_outliers;
 }
 
 
@@ -1002,7 +1245,7 @@ void update_outliers(ControlNetwork                  & cnet,
 void record_points_to_kml(const std::string &kml_path, const cartography::Datum& datum,
                           const double *points, const size_t num_points,
 			  std::set<int>  const& outlier_xyz,
-                          const size_t skip=100, const std::string name="points",
+                          size_t skip=100, const std::string name="points",
                           const std::string icon="http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png") {
 
   if (datum.name() == UNSPECIFIED_DATUM) {
@@ -1043,10 +1286,11 @@ void record_points_to_kml(const std::string &kml_path, const cartography::Datum&
 }
 
 template <class ModelT>
-void do_ba_ceres_one_pass(ModelT                          & ba_model,
+int do_ba_ceres_one_pass(ModelT                          & ba_model,
                           Options                         & opt,
                           ControlNetwork                  & cnet,
                           CameraRelationNetwork<JFeature> & crn,
+                          bool                              first_pass,
                           bool                              last_pass,
                           int                               num_camera_params,
                           int                               num_point_params,
@@ -1073,7 +1317,8 @@ void do_ba_ceres_one_pass(ModelT                          & ba_model,
     for ( int icam = 0; icam < num_cameras; icam++ ) {
       for ( crn_iter fiter = crn[icam].begin(); fiter != crn[icam].end(); fiter++ ){
         int ipt = (**fiter).m_point_id;
-	if (outlier_xyz.find(ipt) != outlier_xyz.end()) continue; // skip outliers
+        if (outlier_xyz.find(ipt) != outlier_xyz.end())
+          continue; // skip outliers
         double * point  = points  + ipt  * num_point_params;
         count_map[point]++;
       }
@@ -1088,7 +1333,8 @@ void do_ba_ceres_one_pass(ModelT                          & ba_model,
 
       // The index of the 3D point
       int ipt = (**fiter).m_point_id;
-      if (outlier_xyz.find(ipt) != outlier_xyz.end()) continue; // skip outliers
+      if (outlier_xyz.find(ipt) != outlier_xyz.end())
+        continue; // skip outliers
 
       VW_ASSERT(int(icam) < num_cameras,
                 ArgumentErr() << "Out of bounds in the number of cameras");
@@ -1135,14 +1381,19 @@ void do_ba_ceres_one_pass(ModelT                          & ba_model,
   for (int ipt = 0; ipt < num_points; ipt++){
     if (cnet[ipt].type() != ControlPoint::GroundControlPoint) continue;
 
-    if (outlier_xyz.find(ipt) != outlier_xyz.end()) continue; // skip outliers
+    if (outlier_xyz.find(ipt) != outlier_xyz.end())
+      continue; // skip outliers
     
     num_gcp++;
     
     Vector3 observation = cnet[ipt].position();
     Vector3 xyz_sigma   = cnet[ipt].sigma();
 
-    ceres::CostFunction* cost_function = XYZError::Create(observation, xyz_sigma);
+    ceres::CostFunction* cost_function;
+    if (!opt.use_llh_error) 
+      cost_function = XYZError::Create(observation, xyz_sigma);
+    else
+      cost_function = LLHError::Create(observation, xyz_sigma, opt.datum);
 
     // Don't use the same loss function as for pixels since that one discounts
     //  outliers and the cameras should never be discounted.
@@ -1197,22 +1448,34 @@ void do_ba_ceres_one_pass(ModelT                          & ba_model,
     }
   }
 
-  vw_out() << "Writing initial condition files..." << std::endl;
+  const size_t MIN_KML_POINTS = 20;  
+  size_t kmlPointSkip = 30;
+  // Figure out a good KML point skip aount
+  if (num_points / kmlPointSkip < MIN_KML_POINTS)
+    kmlPointSkip = num_points / MIN_KML_POINTS;
+  if (kmlPointSkip < 1)
+    kmlPointSkip = 1;
 
   std::string residual_prefix = opt.out_prefix + "-initial_residuals_loss_function";
-  write_residual_logs(residual_prefix, true,  opt, num_cameras, num_camera_params,
-                      num_point_params, cam_residual_counts, num_gcp_residuals, crn,
-                      points, num_points, outlier_xyz, problem);
-  residual_prefix = opt.out_prefix + "-initial_residuals_no_loss_function";
-  write_residual_logs(residual_prefix, false, opt, num_cameras, num_camera_params,
-                      num_point_params, cam_residual_counts, num_gcp_residuals, crn,
-                      points, num_points, outlier_xyz, problem);
+  std::string point_kml_path  = opt.out_prefix + "-initial_points.kml";
+    
+  if (first_pass) { 
+    vw_out() << "Writing initial condition files..." << std::endl;
 
-  const size_t KML_POINT_SKIP = 30;
-  std::string point_kml_path = opt.out_prefix + "-initial_points.kml";
-  record_points_to_kml(point_kml_path, opt.datum, points, num_points, outlier_xyz,
-		       KML_POINT_SKIP, "initial_points",
-                      "http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png");
+    write_residual_logs(residual_prefix, true,  opt, num_cameras, num_camera_params,
+                        num_point_params, cam_residual_counts, num_gcp_residuals, crn,
+                        points, num_points, outlier_xyz, problem);
+    residual_prefix = opt.out_prefix + "-initial_residuals_no_loss_function";
+    write_residual_logs(residual_prefix, false, opt, num_cameras, num_camera_params,
+                        num_point_params, cam_residual_counts, num_gcp_residuals, crn,
+                        points, num_points, outlier_xyz, problem);
+
+
+      
+    record_points_to_kml(point_kml_path, opt.datum, points, num_points, outlier_xyz,
+		         kmlPointSkip, "initial_points",
+                        "http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png");
+  }
 
   // Solve the problem
   ceres::Solver::Options options;
@@ -1227,7 +1490,7 @@ void do_ba_ceres_one_pass(ModelT                          & ba_model,
   else
     options.num_threads = opt.num_threads;
 
-  // Set solver options according to the reccomendations in the Ceres solving FAQs
+  // Set solver options according to the recommendations in the Ceres solving FAQs
   options.linear_solver_type = ceres::SPARSE_SCHUR;
   if (num_cameras < 100)
     options.linear_solver_type = ceres::DENSE_SCHUR;
@@ -1256,7 +1519,6 @@ void do_ba_ceres_one_pass(ModelT                          & ba_model,
     vw_out() << "Found a valid solution, but did not reach the actual minimum." << std::endl;
   }
 
-
   vw_out() << "Writing final condition log files..." << std::endl;
   residual_prefix = opt.out_prefix + "-final_residuals_loss_function";
   write_residual_logs(residual_prefix, true,  opt, num_cameras, num_camera_params,
@@ -1269,12 +1531,12 @@ void do_ba_ceres_one_pass(ModelT                          & ba_model,
 
   point_kml_path = opt.out_prefix + "-final_points.kml";
   record_points_to_kml(point_kml_path, opt.datum, points, num_points, outlier_xyz,
-		       KML_POINT_SKIP, "final_points",
+		       kmlPointSkip, "final_points",
                        "http://maps.google.com/mapfiles/kml/shapes/placemark_circle_highlight.png");
 
   // Print stats for optimized gcp
   if (num_gcp > 0) {
-    vw_out() << "input_gcp_xyz optimized_gcp_xyz diff_norm\n";
+    vw_out() << "input_gcp optimized_gcp diff\n";
     for (int ipt = 0; ipt < num_points; ipt++){
       if (cnet[ipt].type() != ControlPoint::GroundControlPoint) continue;
       if (outlier_xyz.find(ipt) != outlier_xyz.end()) continue; // skip outliers
@@ -1285,16 +1547,89 @@ void do_ba_ceres_one_pass(ModelT                          & ba_model,
       Vector3 opt_gcp;
       for (int p = 0; p < 3; p++) opt_gcp[p] = point[p];
       
-      vw_out() << input_gcp << ' ' << opt_gcp << ' ' << norm_2(input_gcp - opt_gcp) << std::endl;
+      vw_out() << "xyz: " << input_gcp << ' ' << opt_gcp << ' ' << input_gcp - opt_gcp
+               << std::endl;
+
+      input_gcp = opt.datum.cartesian_to_geodetic(input_gcp);
+      opt_gcp   = opt.datum.cartesian_to_geodetic(opt_gcp);
+      vw_out() << "llh: " << input_gcp << ' ' << opt_gcp << ' ' << input_gcp - opt_gcp
+               << std::endl;
     }
   }
 
+  int num_new_outliers = 0;
   if (!last_pass) 
-    update_outliers(cnet, crn, points, num_points,
-                    outlier_xyz,   // in-out
-                    opt, num_cameras, num_camera_params, num_point_params, cam_residual_counts,  
-                    num_gcp_residuals, problem);
+    num_new_outliers =
+      update_outliers(cnet, crn, points, num_points,
+                      outlier_xyz,   // in-out
+                      opt, num_cameras, num_camera_params, num_point_params, cam_residual_counts,  
+                      num_gcp_residuals, problem);
 
+
+  // Create a match file with clean points.
+  // TODO: Make this a function.
+  // TODO: Create this for every pair of images.
+  if (opt.num_ba_passes > 1 && num_cameras == 2 && (num_new_outliers > 0)) {
+
+    vw_out() << "Building clean IP list...\n";
+    std::vector<vw::ip::InterestPoint> left_ip, right_ip;
+    std::vector<int> left_pt, right_pt; // these are used for bookkeeping
+
+    for ( int icam = 0; icam < num_cameras; icam++ ) {
+      for ( crn_iter fiter = crn[icam].begin(); fiter != crn[icam].end(); fiter++ ){
+        
+        // The index of the 3D point
+        int ipt = (**fiter).m_point_id;
+        if (outlier_xyz.find(ipt) != outlier_xyz.end())
+          continue; // skip outliers
+        
+        // Skip gcp
+        if (cnet[ipt].type() == ControlPoint::GroundControlPoint)
+          continue;
+        
+        VW_ASSERT(int(icam) < num_cameras,
+                  ArgumentErr() << "Out of bounds in the number of cameras");
+        VW_ASSERT(int(ipt)  < num_points,
+                  ArgumentErr() << "Out of bounds in the number of points");
+        
+        Vector2 observation = (**fiter).m_location; // pixel value
+        ip::InterestPoint P;
+        P.x = observation.x();
+        P.y = observation.y();
+        if (icam == 0) {
+          left_ip.push_back(P);
+          left_pt.push_back(ipt);
+        }else if (icam == 1){
+          right_ip.push_back(P);
+          right_pt.push_back(ipt);
+        }
+      }
+    }
+
+    // Book-keeping, a given left ip and right ip must correspond to same xyz
+    if (left_pt.size() != right_pt.size()) 
+      vw_throw(ArgumentErr() << "Book-keeping error 1 in bundle adjustment.\n");
+
+    for (size_t pcount = 0; pcount < left_pt.size(); pcount++) {
+      if (left_pt[pcount] != right_pt[pcount]) 
+        vw_throw(ArgumentErr() << "Book-keeping error 2 in bundle adjustment.\n");
+    }
+
+    // TODO: Move this into the IP finding code!
+    // Compute the coverage fraction
+    Vector2i right_image_size = file_image_size(opt.image_files[1]);
+    int right_ip_width = right_image_size[0]*
+                          static_cast<double>(100-opt.ip_edge_buffer_percent)/100.0;
+    Vector2i ip_size(right_ip_width, right_image_size[1]);
+    double ip_coverage = calc_ip_coverage_fraction(right_ip, ip_size);
+    vw_out() << "IP coverage fraction after cleaning = " << ip_coverage << std::endl;
+
+    std::string match_file = opt.out_prefix  + "-clean.match";
+    vw_out() << "Writing: " << match_file << std::endl;
+    ip::write_binary_match_file(match_file, left_ip, right_ip);
+  } // End outlier update case
+      
+  return num_new_outliers;
 }
 
 /// Use Ceres to do bundle adjustment. The camera and point variables
@@ -1344,6 +1679,12 @@ void do_ba_ceres(ModelT & ba_model, Options & opt ){
   // The camera positions and orientations before we float them
   std::vector<double> orig_cameras_vec = cameras_vec;
 
+  std::vector<double> orig_points_vec, orig_intrinsics_vec;
+  if (opt.num_ba_passes > 1) {
+    orig_points_vec = points_vec;
+    orig_intrinsics_vec = intrinsics_vec;
+  }
+  
   CameraRelationNetwork<JFeature> crn;
   crn.read_controlnetwork(cnet);
 
@@ -1351,36 +1692,51 @@ void do_ba_ceres(ModelT & ba_model, Options & opt ){
   std::set<int> outlier_xyz;
 
   if (opt.num_ba_passes <= 0)
-    vw_throw(ArgumentErr()
-             << "Error: Expecting at least one bundle adjust pass.\n");
-  
-  // Camera extrinsics and intrinsics
-  double* cameras    = &cameras_vec[0];
-  double* intrinsics = NULL;
-  if (num_intrinsic_params > 0)
-    intrinsics = &intrinsics_vec[0];
-  
-  double* points = &points_vec[0];
+    vw_throw(ArgumentErr() << "Error: Expecting at least one bundle adjust pass.\n");
   
   for (int pass = 0; pass < opt.num_ba_passes; pass++) {
-    bool last_pass = (pass == opt.num_ba_passes - 1);
 
-    if (opt.num_ba_passes > 1) 
+    if (opt.num_ba_passes > 1) {
       vw_out() << "Bundle adjust pass: " << pass << std::endl;
+      // Go back to the original inputs to optimize, sans the outliers. Note that we
+      // copy values, to not disturb the pointer of each vector.
+      for (size_t i = 0; i < cameras_vec.size(); i++)    cameras_vec[i]   = orig_cameras_vec[i];
+      for (size_t i = 0; i < points_vec.size(); i++)     points_vec[i]    = orig_points_vec[i];
+      for (size_t i = 0; i < intrinsics_vec.size(); i++) intrinsics_vec[i]=orig_intrinsics_vec[i];
+    }
     
-    do_ba_ceres_one_pass(ba_model, opt,  cnet,  crn, last_pass,
-                         num_camera_params,  num_point_params,  
-                         num_intrinsic_params, num_cameras, num_points,  
-                         orig_cameras_vec,  cameras,  intrinsics,  points,  
-                         outlier_xyz);
+    // Camera extrinsics and intrinsics
+    double* cameras    = &cameras_vec[0];
+    double* points     = &points_vec[0];
+    double* intrinsics = NULL;
+    if (num_intrinsic_params > 0) intrinsics = &intrinsics_vec[0];
+    
+    bool last_pass = (pass == opt.num_ba_passes - 1);
+    int num_new_outliers = do_ba_ceres_one_pass(ba_model, opt,  cnet,  crn, (pass==0), last_pass,
+                                                num_camera_params,  num_point_params,  
+                                                num_intrinsic_params, num_cameras, num_points,  
+                                                orig_cameras_vec,  cameras,  intrinsics,  points,  
+                                                outlier_xyz);
 
-    // We must not include GCP among outliers no matter what!
+    if (!last_pass && num_new_outliers == 0) {
+      vw_out() << "No new outliers removed. No more passes are needed.\n";
+      break;
+    }
+
+    int num_points_remaining = num_points - outlier_xyz.size();
+    if (opt.num_ba_passes > 1 && num_points_remaining < opt.min_matches) {
+      // Do not throw if there were is just one pass, as no outlier filtering happened.
+      // This is needed to not break functionality when only gcp are passed as inputs.
+      vw_throw(ArgumentErr() << "Error: Too few points remain after filtering!.\n");
+    }
   }
 
   // Copy the latest version of the optimized intrinsic variables back
   // into the the separate parameter vectors in ba_model, right after
   // the already updated extrinsic parameters.
   typename ModelT::camera_intr_vector_t concat;
+  double* intrinsics = NULL;
+  if (num_intrinsic_params > 0) intrinsics = &intrinsics_vec[0];
   for (int icam = 0; icam < num_cameras; icam++){
     ba_model.concat_extrinsics_intrinsics(&cameras_vec[icam*num_camera_params],
                                           intrinsics, concat);
@@ -1554,7 +1910,7 @@ void do_ba_with_model(Options& opt){
     do_ba_costfun<L2Error>( L2Error(), opt );
   }else{
     vw_throw( ArgumentErr() << "Unknown cost function: " << opt.cost_function
-              << ". Options are: Cauchy, PseudoHuber, Huber, L1, L2.\n" );
+                            << ". Options are: Cauchy, PseudoHuber, Huber, L1, L2.\n" );
   }
 }
 
@@ -1723,7 +2079,8 @@ bool init_pinhole_model_with_camera_positions(Options &opt,
   
   const int MIN_NUM_MATCHES = 3;
   if (num_matches_found < MIN_NUM_MATCHES)
-    vw_throw( ArgumentErr() << "Not enough camera position matches to initialize sensor models!\n" );
+    vw_throw( ArgumentErr() << "At least " << MIN_NUM_MATCHES 
+                            << " camera position matches are required to initialize sensor models!\n" );
   
   // Populate matrices containing the current and known camera positions.
   vw::Matrix<double> points_in(3, num_matches_found), points_out(3, num_matches_found);
@@ -2182,6 +2539,8 @@ void create_gcp_from_mapprojected_images(Options const& opt){
 
 }
 
+// TODO: Change something so we don't have to repeat all the stereo IP options here!
+
 void handle_arguments( int argc, char *argv[], Options& opt ) {
   double nan = std::numeric_limits<double>::quiet_NaN();
   po::options_description general_options("");
@@ -2217,7 +2576,7 @@ void handle_arguments( int argc, char *argv[], Options& opt ) {
     ("semi-minor-axis",  po::value(&opt.semi_minor)->default_value(0),
                          "Explicitly set the datum semi-minor axis in meters (needed only if ground control points are used).")
     ("session-type,t",   po::value(&opt.stereo_session_string)->default_value(""),
-                         "Select the stereo session type to use for processing. Options: pinhole isis dg rpc spot5 aster. Usually the program can select this automatically by the file extension.")
+                         "Select the stereo session type to use for processing. Options: pinhole nadirpinhole isis dg rpc spot5 aster. Usually the program can select this automatically by the file extension.")
     ("min-matches",      po::value(&opt.min_matches)->default_value(30),
                          "Set the minimum  number of matches between images that will be considered.")
     ("ip-detect-method", po::value(&opt.ip_detect_method)->default_value(0),
@@ -2228,6 +2587,14 @@ void handle_arguments( int argc, char *argv[], Options& opt ) {
      "A higher factor will result in more interest points, but perhaps also more outliers.")
     ("ip-uniqueness-threshold",          po::value(&opt.ip_uniqueness_thresh)->default_value(0.7),
      "A higher threshold will result in more interest points, but perhaps less unique ones.")
+    ("ip-side-filter-percent",        po::value(&opt.ip_edge_buffer_percent)->default_value(-1),
+     "Remove matched IPs this percentage from the image left/right sides.")
+    ("normalize-ip-tiles", po::bool_switch(&opt.ip_normalize_tiles)->default_value(false)->implicit_value(true),
+       "Individually normalize tiles used for IP detection.")
+    ("disable-tri-ip-filter",    po::bool_switch(&opt.disable_tri_filtering)->default_value(false)->implicit_value(true),
+     "Skip tri_ip filtering.")
+    ("ip-debug-images",     po::value(&opt.ip_debug_images)->default_value(false)->implicit_value(true),
+                    "Write debug images to disk when detecting and matching interest points.")
     ("elevation-limit",        po::value(&opt.elevation_limit)->default_value(Vector2(0,0), "auto"),
      "Limit on expected elevation range: Specify as two values: min max.")
     // Note that we count later on the default for lon_lat_limit being BBox2(0,0,0,0).
@@ -2259,11 +2626,14 @@ void handle_arguments( int argc, char *argv[], Options& opt ) {
      "How many interest points to detect in each 1024^2 image tile (default: automatic determination).")
     ("num-passes",             po::value(&opt.num_ba_passes)->default_value(1),
      "How many passes of bundle adjustment to do. If more than one, outliers will be removed between passes using --remove-outliers-params, and re-optimization will take place. Match files and residual files with the outliers removed will be written to disk.")
-    ("remove-outliers-params",        po::value(&opt.remove_outliers_params_str)->default_value("75.0 3.0 2.0", "'pct factor max_err'"),
-	    "Outlier removal based on percentage, when more than one bundle adjustment pass is used. Triangulated points with reprojection error in pixels larger than 'pct'-th percentile times 'factor' and also larger than 'max_err' will be removed as outliers. Specify as a list in quotes.")
+    ("remove-outliers-params",        po::value(&opt.remove_outliers_params_str)->default_value("75.0 3.0 2.0 3.0", "'pct factor err1 err2'"),
+	    "Outlier removal based on percentage, when more than one bundle adjustment pass is used. Triangulated points with reprojection error in pixels larger than min(max('pct'-th percentile * 'factor', err1), err2) will be removed as outliers. Hence, never remove errors smaller than err1 but always remove those bigger than err2. Specify as a list in quotes. Default: 75.0 3.0 2.0 3.0.")
     
     ("min-triangulation-angle",             po::value(&opt.min_triangulation_angle)->default_value(0.1),
      "The minimum angle, in degrees, at which rays must meet at a triangulated point to accept this point as valid.")
+    ("use-lon-lat-height-gcp-error", po::bool_switch(&opt.use_llh_error)->default_value(false)->implicit_value(true),
+     "When having GCP, instead of minimizing the xyz error (computed vs what is in the GCP file), minimize the lon-lat-height error. This way, if the height is not known accurately, in the GCP file the third sigma (corresponding to the height), can be given a bigger weight to reduce its importance.")
+    
     ("mapprojected-data",  po::value(&opt.mapprojected_data)->default_value(""),
      "Given map-projected versions of the input images and the DEM mapprojected onto, and IP matches among them, create IP matches among the un-projected images before doing bundle adjustment. Niche and experimental, not for general use.")
     ("gcp-data",  po::value(&opt.gcp_data)->default_value(""),
@@ -2358,7 +2728,7 @@ void handle_arguments( int argc, char *argv[], Options& opt ) {
     vw_throw( ArgumentErr() << "Solving for intrinsic parameters is only supported with pinhole cameras.\n");
 
   vw::string_replace(opt.remove_outliers_params_str, ",", " "); // replace any commas
-  opt.remove_outliers_params = vw::str_to_vec<vw::Vector3>(opt.remove_outliers_params_str);
+  opt.remove_outliers_params = vw::str_to_vec<vw::Vector<double, 4> >(opt.remove_outliers_params_str);
   
   // Copy the IP settings to the global stereo_settings() object
   asp::stereo_settings().ip_matching_method      = opt.ip_detect_method;
@@ -2372,6 +2742,10 @@ void handle_arguments( int argc, char *argv[], Options& opt ) {
   asp::stereo_settings().lon_lat_limit           = opt.lon_lat_limit;
   asp::stereo_settings().individually_normalize  = opt.individually_normalize;
   asp::stereo_settings().min_triangulation_angle = opt.min_triangulation_angle;
+  asp::stereo_settings().disable_tri_filtering   = opt.disable_tri_filtering;
+  asp::stereo_settings().ip_edge_buffer_percent  = opt.ip_edge_buffer_percent;
+  asp::stereo_settings().ip_debug_images         = opt.ip_debug_images;
+  asp::stereo_settings().ip_normalize_tiles      = opt.ip_normalize_tiles;
 
   // Ensure good order
   if ( asp::stereo_settings().lon_lat_limit != BBox2(0,0,0,0) ) {
@@ -2474,6 +2848,7 @@ void handle_arguments( int argc, char *argv[], Options& opt ) {
   }
   
 }
+
 
 // ================================================================================
 
@@ -2583,7 +2958,7 @@ int main(int argc, char* argv[]) {
         // - The points are written to a file on disk.
         std::string camera1_path = opt.camera_files[i];
         std::string camera2_path = opt.camera_files[j];        
-        std::string match_filename = ip::match_filename(opt.out_prefix, image1_path, image2_path);
+        std::string match_filename = ip::match_filename(opt.out_prefix, image1_path, image2_path);       
         match_files[ std::pair<int, int>(i, j) ] = match_filename;
         if (fs::exists(match_filename)) {
           vw_out() << "\t--> Using cached match file: " << match_filename << "\n";
@@ -2622,6 +2997,40 @@ int main(int argc, char* argv[]) {
                                nodata1, nodata2, match_filename,
                                opt.camera_models[i].get(),
                                opt.camera_models[j].get());
+         /*
+          // Experimental code to filter the IPs by removing any found in the
+          //  far left and right sides of the input images.
+          // - TODO: Once this code is reliable move it to the IP finding code
+          if (opt.ip_extra_filter_threshold > 0) {
+
+            // Load the IPs we just wrote, apply filtering, and overwrite the file on disk.
+            std::vector<ip::InterestPoint> in_ip1, in_ip2, matched_ip1, matched_ip2;
+            vw_out() << "\t    * Loading match file: " << match_filename << "\n";
+            ip::read_binary_match_file(match_filename, in_ip1, in_ip2);
+            vw_out() << "Read in " << in_ip1.size() << " points.\n";
+            
+            filter_ip_sides(in_ip1, in_ip2, matched_ip1, matched_ip2,
+                            image1_view.cols(), image2_view.cols(),
+                            opt.ip_extra_filter_threshold);
+
+            vw_out() << "Wrote out " << matched_ip1.size() << " points.\n";
+
+            vw_out() << "\t    * Rewriting match file: " << match_filename << "\n";
+            ip::write_binary_match_file(match_filename, matched_ip1, matched_ip2);
+          } // End experimental IP filtering
+        */
+          
+        // TODO: Move this into the IP finding code!
+        // Compute the coverage fraction
+        std::vector<ip::InterestPoint> ip1, ip2;
+        ip::read_binary_match_file(match_filename, ip1, ip2);       
+        int right_ip_width = rsrc1->cols()*
+                              static_cast<double>(100-opt.ip_edge_buffer_percent)/100.0;
+        Vector2i ip_size(right_ip_width, rsrc1->rows());
+        double ip_coverage = calc_ip_coverage_fraction(ip2, ip_size);
+        vw_out() << "IP coverage fraction = " << ip_coverage << std::endl;
+          
+                               
           ++num_pairs_matched;
         } catch ( const std::exception& e ){
           vw_out() << "Could not find interest points between images "

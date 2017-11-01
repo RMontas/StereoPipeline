@@ -101,7 +101,13 @@ namespace asp {
     double epipolar_threshold;              /// Max distance from epipolar line to search for IP matches.
     double ip_inlier_factor;                /// General scaling factor for IP finding, a larger value allows more IPs to match.
     double ip_uniqueness_thresh;            /// Min percentage distance between closest and second closest IP descriptors.
+    bool   disable_tri_filtering;           ///< Turn of tri-ip filtering.
     int num_scales;                         /// How many scales to use if detecting interest points with OBALoG. If not specified, 8 will be used. 
+    int    ip_edge_buffer_percent;          ///< When detecting IP, throw out points within this many % of pixels
+                                            ///  of the left/right edges of the images being matched.
+    bool   ip_normalize_tiles;              ///< Individually normalize tiles for IP detection.
+    bool   ip_debug_images;                 ///< Write debug interest point images.
+    
     double nodata_value;                    ///< Pixels with values less than or equal to this number are treated as no-data.
                                             //  This overrides the nodata values from input images.
     double nodata_pixel_percentage;         ///< Percentage of low-value pixels treated as no-data
@@ -123,6 +129,8 @@ namespace asp {
                                       //     (see disparity-estimation-dem)
                                       // 3 = Use low-res disparity produced by sparse_disp
                                       //     (in development)
+
+    int   min_num_ip;                 ///< Minimum number of IP's needed for search range estimation.
 
     float seed_percent_pad;           ///< Pad amound towards the IP found
     vw::uint16 cost_mode;             // 0 = absolute difference
@@ -198,6 +206,9 @@ namespace asp {
     float  far_universe_radius;       // Radius of the universe in meters
     std::string bundle_adjust_prefix; // Use the camera adjustments obtained by previously running bundle_adjust with the output prefix specified here.
 
+    // Pull this many matches from the stereo disparity
+    int num_matches_from_disparity;
+    
     // piecewise adjustments
     int image_lines_per_piecewise_adjustment;
     vw::Vector2 piecewise_adjustment_percentiles;

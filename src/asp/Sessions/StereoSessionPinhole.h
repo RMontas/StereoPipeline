@@ -25,9 +25,13 @@
 #include <asp/Core/InterestPointMatching.h>
 #include <vw/Stereo/StereoModel.h>
 #include <asp/Sessions/StereoSession.h>
+#include <vw/Camera/CameraTransform.h>
+#include <vw/Camera/PinholeModel.h>
 
 namespace asp {
 
+  typedef vw::camera::CameraTransform<vw::camera::PinholeModel, vw::camera::PinholeModel> PinholeCamTrans;
+  
  class StereoSessionPinhole: public StereoSession {
   public:
     StereoSessionPinhole() {}
@@ -57,16 +61,27 @@ namespace asp {
                             boost::shared_ptr<vw::camera::CameraModel> &right_cam,
                             vw::Vector2i &left_out_size, vw::Vector2i &right_out_size);
 
+    /// Return the input camera models with no alignment applied.
+    /// - This only matters in the epipolar alignment case, where the normal camera model
+    ///   functions return the aligned camera models.
+    void get_unaligned_camera_models(boost::shared_ptr<vw::camera::CameraModel> &left_cam,
+                                     boost::shared_ptr<vw::camera::CameraModel> &right_cam);
+
     /// Transforms from pixel coordinates on disk to original unwarped image coordinates.
     /// - For reversing our arithmetic applied in preprocessing.
     typedef vw::HomographyTransform tx_type;
     tx_type tx_left () const;
     tx_type tx_right() const;
 
-    typedef vw::stereo::StereoModel stereo_model_type;
+   typedef vw::stereo::StereoModel stereo_model_type;
 
    static bool isMapProjected() { return false; }
 
+   // TODO: Need tx_left to return a pointer, and then the logic of the function below
+   // needs to be incorporated into tx_left(). This because for epipolar alignment
+   // the camera transform type is not a homography transform.
+   void pinhole_cam_trans(PinholeCamTrans & left_trans, PinholeCamTrans & right_trans);
+   
    // TODO: Clean these up!
 
    // Override the base class functions according to the class paramaters

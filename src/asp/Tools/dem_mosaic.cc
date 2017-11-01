@@ -227,7 +227,7 @@ std::string processed_proj4(std::string const& srs){
 }
 
 struct Options : vw::cartography::GdalWriteOptions {
-  string dem_list_file, out_prefix, target_srs_string, tile_list_str;
+  string dem_list_file, out_prefix, target_srs_string, tile_list_str, this_dem_as_reference;
   vector<string> dem_files;
   double tr, geo_tile_size;
   bool   has_out_nodata;
@@ -351,6 +351,8 @@ public:
   typedef CropView<ImageView<pixel_type> > prerasterize_type;
   inline prerasterize_type prerasterize(BBox2i bbox) const {
 
+    BBox2i orig_box = bbox;
+    
     // When doing priority blending, we will do all the work in the
     // output pixels domain. Hence we need to take into account the
     // bias here rather than later.
@@ -361,8 +363,8 @@ public:
     // of the precision of the inputs, for increased accuracy.
     // - The image data buffers are initialized here
     typedef PixelGrayA<double> DoubleGrayA;
-    ImageView<double> tile   (bbox.width(), bbox.height());
-    ImageView<double> weights(bbox.width(), bbox.height());
+    ImageView<double> tile   (bbox.width(), bbox.height()); // the output tile (in most cases)
+    ImageView<double> weights(bbox.width(), bbox.height()); // accumulated weights (in most cases)
     fill( tile, m_opt.out_nodata_value );
     fill( weights, 0.0 );
 
@@ -483,11 +485,16 @@ public:
           }
         }
       }
-      
+
       // Mark the handle to the image as not in use, though we still
       // keep that image file open, for increased performance, unless
       // their number becomes too large.
       m_imgMgr.release(dem_iter);
+      
+      if (dem_iter == 0 && m_opt.this_dem_as_reference != "") {
+        // We won't actually use this DEM, we just do all in reference to it.
+        continue;
+      }
       
       // Compute linear weights
       ImageView<double> local_wts = grassfire(notnodata(select_channel(dem, 0), nodata_value));
@@ -931,6 +938,8 @@ public:
     long long int num_valid_in_tile = 0;
     for (int col = 0; col < tile.cols(); col++) {
       for (int row = 0; row < tile.rows(); row++) {
+        Vector2 pix = Vector2(col, row) + bbox.min();
+        if (!orig_box.contains(pix)) continue; // in case the box got expanded, ignore the padding
         if (tile(col, row) == m_opt.out_nodata_value) continue;
         num_valid_in_tile++;
       }
@@ -1136,6 +1145,8 @@ void handle_arguments( int argc, char *argv[], Options& opt ) {
      "Save the weight image that tracks how much the input DEM with given index contributed to the output mosaic at each pixel (smallest index is 0).")
     ("first-dem-as-reference", po::bool_switch(&opt.first_dem_as_reference)->default_value(false),
      "The output DEM will have the same size, grid, and georeference as the first one, with the other DEMs blended within its perimeter.")
+    ("this-dem-as-reference", po::value(&opt.this_dem_as_reference)->default_value(""),
+     "The output DEM will have the same size, grid, and georeference as this one, but it will not be used in the mosaic.")
     ("save-index-map",   po::bool_switch(&opt.save_index_map)->default_value(false),
      "For each output pixel, save the index of the input DEM it came from (applicable only for --first, --last, --min, and --max). A text file with the index assigned to each input DEM is saved as well.")
     ("threads",             po::value<int>(&opt.num_threads)->default_value(4),
@@ -1261,6 +1272,18 @@ void handle_arguments( int argc, char *argv[], Options& opt ) {
     opt.dem_files = unregistered;
   }
 
+  if (opt.this_dem_as_reference != "" && opt.first_dem_as_reference) {
+    vw_throw(ArgumentErr() << "Cannot have both options --first-dem-as-reference "
+             << "and --this-dem-as-reference.\n"
+	     << usage << general_options );
+  }
+
+  // We will co-opt the logic of first_dem_as_reference but won't blend the reference DEM
+  if (opt.this_dem_as_reference != "") {
+    opt.first_dem_as_reference = true;
+    opt.dem_files.insert(opt.dem_files.begin(), opt.this_dem_as_reference);
+  }
+  
   if (int(opt.dem_files.size()) <= opt.save_dem_weight) {
     vw_throw(ArgumentErr() << "Cannot save weights for given index as it is out of bounds.\n"
 	     << usage << general_options );

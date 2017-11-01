@@ -73,6 +73,11 @@ if __name__ == '__main__':
     p.add_option('-v', '--version',        dest='version',     default=False, action='store_true',
                  help='Display the version of software.')
 
+    # This must not be used in production. Will not work on the mac. A temporary undocumented
+    # thing.
+    p.add_option('--check-mem-usage',   dest='mem_usage',     default=False, action='store_true',
+                 help='Check stereo_corr run time and memory usage.')
+
     # Debug options
     p.add_option('--dry-run',              dest='dryrun',      default=False, action='store_true',
                  help=optparse.SUPPRESS_HELP)
@@ -139,12 +144,16 @@ if __name__ == '__main__':
         if ( opt.entry_point <= step ):
             if ( opt.stop_point <= step ): sys.exit()
 
-            # Do low-res correlation, this happens just once.
-            calc_lowres_disp(args, opt, sep)
+            if ( opt.seed_mode == 0 ):
+                # No low resolution seed, go straight to full resolution correlation
+                stereo_run('stereo_corr', args, opt, msg='%d: Correlation' % step)           
+            else:
+                # Do low-res correlation, this happens just once.
+                calc_lowres_disp(args, opt, sep)
 
-            # Run full-resolution stereo correlation
-            args.extend(['--skip-low-res-disparity-comp'])
-            stereo_run('stereo_corr', args, opt, msg='%d: Correlation' % step)
+                # Run full-resolution stereo correlation
+                args.extend(['--skip-low-res-disparity-comp'])
+                stereo_run('stereo_corr', args, opt, msg='%d: Correlation' % step)
 
         # Refinement
         step = Step.rfne

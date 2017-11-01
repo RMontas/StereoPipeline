@@ -50,7 +50,20 @@ os.environ["PATH"] = toolspath      + os.pathsep + os.environ["PATH"]
 os.environ["PATH"] = binpath        + os.pathsep + os.environ["PATH"]
 
 louUser = 'oalexan1' # all data is stored under this user name
+
+g_start_time = -1
+g_stop_time  = -1
+
+def start_time():
+    global g_start_time, g_stop_time
+    g_start_time = time.time()
     
+def stop_time(job, logger):
+    global g_start_time, g_stop_time
+    g_stop_time = time.time()
+    wall_s = float(g_stop_time - g_start_time)/3600.0
+    logger.info( ("Elapsed time for %s is %g hours." % (job, wall_s) ) )
+
 def workDirs():
     '''When fetching data, return the paths where it is stored temporarily on pfe,
     and for archival, on lou.'''
@@ -83,6 +96,8 @@ def tarAndWipe(options, logger):
     lfeCmd = 'cd ' + pfePath + '; tar cfv ' + lfePath + '/' + \
              options.outputFolder + '.tar ' + options.outputFolder
 
+    start_time()
+    
     cmd = 'ssh ' + louUser + '@lfe "' + lfeCmd + '"'
     logger.info(cmd)
     p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
@@ -95,6 +110,9 @@ def tarAndWipe(options, logger):
     if options.outputFolder == "" or options.outputFolder[0] == '.':
         raise Exception('Output folder is not as expected. ' +
                         'Not deleting anything just in case.')
+
+    # Do this here, before the wiping
+    stop_time("tar_and_wipe", logger)
 
     logger.info('Will wipe: ' + options.outputFolder)
     try:
@@ -111,17 +129,21 @@ def startWithLouArchive(options, logger):
     (pfePath, lfePath) = workDirs()
 
     # See tarAndWipe() for the logic of how one can work with pfe and lfe
-    lfeCmd = 'cd ' + lfePath + '; tar xfv ' + lfePath + '/' + options.outputFolder + '.tar' + \
+    tarFile = options.outputFolder + '.tar'
+    lfeCmd = 'cd ' + lfePath + '; tar xfv ' + lfePath + '/' + tarFile + \
              ' -C ' + pfePath
 
     cmd = 'ssh ' + louUser + '@lfe "' + lfeCmd + '"'
     logger.info(cmd)
-    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-    output, error = p.communicate()
-    if p.returncode != 0:
-        raise Exception('Failed to untar lfe archive: ' + options.outputFolder + '.tar')
-    else:
-        logger.info('Success untarring lfe archive.')
+    os.system(cmd)
+    #p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+    #output, error = p.communicate()
+    #if p.returncode != 0:
+    #    # Don't fail, just continue
+    #    logger.info('Failed to untar lfe archive: ' + tarFile)
+    #    #raise Exception('Failed to untar lfe archive: ' + options.outputFolder + '.tar')
+    #else:
+    #    logger.info('Success untarring lfe archive.')
 
     return 0
 
@@ -144,6 +166,12 @@ def main(argsIn):
         parser.add_option("--site",  dest="site", default=None,
                           help="Name of the location of the images (AN, GR, or AL)")
 
+        parser.add_option("--camera-calibration-folder",  dest="inputCalFolder", default=None,
+                          help="The folder containing camera calibration.")
+
+        parser.add_argument("--reference-dem-folder",  dest="refDemFolder", default=None,
+                          help="The folder containing DEMs that created orthoimages.")
+        
         # Python treats numbers starting with 0 as being in octal rather than decimal.
         # Ridiculous. So read them as strings and convert to int. 
         parser.add_option('--start-frame', dest='startFrameStr', default=None,
@@ -157,6 +185,16 @@ def main(argsIn):
         parser.add_option("--skip-validate", action="store_true", dest="skipValidate",
                           default=False,
                           help="Skip input data validation.")
+        parser.add_option("--ignore-missing-lidar", action="store_true", dest="ignoreMissingLidar",
+                          default=False,
+                          help="Keep going if the lidar is missing.")
+        parser.add_option("--no-lidar-convert", action="store_true", dest="noLidarConvert",
+                          default=False,
+                          help="Skip lidar files in the conversion step.")
+
+        parser.add_option("--no-nav", action="store_true", dest="noNav",
+                          default=False,
+                          help="Skip dealing with raw nav data.")
 
         parser.add_option("--refetch-index", action="store_true", dest="refetchIndex",
                           default=False,
@@ -201,7 +239,9 @@ def main(argsIn):
 
     # Unarchive, then continue with fetching
     if options.startWithLouArchive:
+        start_time()
         startWithLouArchive(options, logger)
+        stop_time("fetch_from_lou", logger)
 
     cmd = (('--yyyymmdd %s --site %s --start-frame %d --stop-frame %d ' +
             '--max-num-lidar-to-fetch %d --stop-after-convert --no-ortho-convert --refetch')
@@ -213,11 +253,42 @@ def main(argsIn):
         cmd += ' --stop-after-index-fetch' 
     if options.skipValidate:
         cmd += ' --skip-validate'
+    if options.ignoreMissingLidar:
+        cmd += ' --ignore-missing-lidar'
+    if options.noLidarConvert:
+        cmd += ' --no-lidar-convert'
+    if options.noNav:
+        cmd += ' --no-nav'
+    if options.inputCalFolder is not None:
+        cmd += ' --camera-calibration-folder ' + options.inputCalFolder
+
+    if options.refDemFolder is not None:
+        cmd += ' --reference-dem-folder ' + options.refDemFolder
+
+    # Refetch all nav stuff, as it was unreliable in the past
+    navFolder = icebridge_common.getNavFolder(options.outputFolder)
+    navCameraFolder = icebridge_common.getNavCameraFolder(options.outputFolder)
+    if os.path.exists(navFolder):
+        logger.info("Wiping: " + navFolder)
+        os.system('rm -rfv ' + navFolder)
+    if os.path.exists(navCameraFolder):
+        logger.info("Wiping: " + navCameraFolder)
+        os.system('rm -rfv ' + navCameraFolder)
+
+    # Wipe processed lidar, as sometimes errors crept in.
+    logger.info("Wiping processed lidar:")
+    lidarFolder = icebridge_common.getLidarFolder(options.outputFolder)
+    if os.path.exists(lidarFolder):
+        os.system('rm -fv ' + lidarFolder + '/*csv')
+    pairedFolder = icebridge_common.getPairedLidarFolder(lidarFolder)
+    if os.path.exists(pairedFolder):
+        os.system('rm -rfv ' + pairedFolder)
         
     logger.info("full_processing_script.py " + cmd)
-    
+    start_time()
     if full_processing_script.main(cmd.split()) < 0:
         return -1
+    stop_time("fetch_validate", logger)
 
     # Archive after fetching
     if options.tarAndWipe:

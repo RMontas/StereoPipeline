@@ -75,9 +75,9 @@ def makeDateFolder(year, month, day, ext, fileType):
         return datePart
 
 def hasGoodLat(latitude, isSouth):
+    '''Return true if latitude and isSouth parameters match.'''
     if (isSouth and latitude < 0) or ( (not isSouth) and latitude > 0 ):
         return True
-
     return False
 
 def fetchAndParseIndexFileAux(isSouth, separateByLat, dayVal,
@@ -182,9 +182,9 @@ def fetchAndParseIndexFileAux(isSouth, separateByLat, dayVal,
                 list2.append(filename)
 
             prevStamp = currStamp # for next iteration
-            
+
         if isBigGap:
-           if dayVal == 0: 
+           if dayVal == 0:
                fileList = list2[:] # current day
            else:
                fileList = list1[:] # spillover from prev day
@@ -232,9 +232,13 @@ def fetchAndParseIndexFileAux(isSouth, separateByLat, dayVal,
 
 # These exist both in AN and GR, all mixed up, and have to separate by lat
 def isInSeparateByLatTable(yyyymmdd):
-    return yyyymmdd in ['20150924', '20151005', '20151020', '20151022'];
+    ''''''
+    return yyyymmdd in ['20150923', '20150924', '20151004', '20151005',
+                        '20151019', '20151020', '20151021', '20151022'];
     
 def twoFlightsInOneDay(site, yyyymmdd):
+    '''Return true if there are two flights in one day.'''
+    
     # For this day, there are GR_20100422a and GR_20100422b
     if site == 'GR' and yyyymmdd == '20100422':
         return True
@@ -249,6 +253,13 @@ def getFolderUrl(yyyymmdd, year, month, day,
     ext = ''
     if len(yyyymmdd) == 9:
         ext = yyyymmdd[8]
+
+    if fileType == 'nav':
+        # This is the simplest, usually one file per flight.
+        base = 'https://n5eil01u.ecs.nsidc.org/ICEBRIDGE_FTP/IPAPP1B_GPSInsCorrected_v01'
+        yearFolder = makeYearFolder(year, site)
+        folderUrl  = os.path.join(base, yearFolder)
+        return folderUrl
 
     if fileType == 'jpeg':
 
@@ -288,8 +299,9 @@ def getFolderUrl(yyyymmdd, year, month, day,
     
     return folderUrl
 
-# Create a list of all files that must be fetched unless done already.
+
 def fetchAndParseIndexFile(options, isSouth, baseCurlCmd, outputFolder):
+    '''Create a list of all files that must be fetched unless done already.'''
 
     # For AN 20091112, etc, some of the ortho images are stored at the
     # beginning of the next day's flight. Need to sort this out, and
@@ -340,9 +352,22 @@ def fetchAndParseIndexFile(options, isSouth, baseCurlCmd, outputFolder):
     # and we have to fetch from the next day, don't fetch unless
     # in the jpeg index.
     if len(dayVals) > 1 and options.type != 'jpeg':
-        jpegIndexPath = icebridge_common.csvIndexFile(options.jpegFolder)
+        jpegFolder = icebridge_common.getJpegFolder(os.path.dirname(outputFolder))
+        jpegIndexPath = icebridge_common.csvIndexFile(jpegFolder)
         (jpegFrameDict, jpegUrlDict) = icebridge_common.readIndexFile(jpegIndexPath)
-        
+
+    orthoStamp = {}
+    if options.type == 'fireball':
+        # This is a bugfix. Ensure that the fireball DEM has not just
+        # the same frame number, but also same timestamp as the ortho.
+        orthoFolder = icebridge_common.getOrthoFolder(os.path.dirname(outputFolder))
+        orthoIndexPath = icebridge_common.csvIndexFile(orthoFolder)
+        (orthoFrameDict, orthoUrlDict) = icebridge_common.readIndexFile(orthoIndexPath)
+        for frame in sorted(orthoFrameDict.keys()):
+            filename = orthoFrameDict[frame]
+            [imageDateString, imageTimeString] = icebridge_common.parseTimeStamps(filename)
+            orthoStamp[frame] = imageTimeString
+            
     for dayVal in dayVals:
 
         if len(dayVals) > 1:
@@ -420,8 +445,13 @@ def fetchAndParseIndexFile(options, isSouth, baseCurlCmd, outputFolder):
                         break
 
                 if not isGood:
-                    raise Exception("None of these URLs are good: " + " ".join(folderUrls))
-                
+                    if options.type in LIDAR_TYPES and options.ignoreMissingLidar:
+                        logger.info("No lidar. None of these URLs are good: " +
+                                    " ".join(folderUrls))
+                    else:
+                        raise Exception("None of these URLs are good: " +
+                                        " ".join(folderUrls))
+                    
         else: # Other cases are simpler
             folderUrl = getFolderUrl(options.yyyymmdd, options.year, options.month,
                                      options.day, dayVal, # note here the dayVal
@@ -437,6 +467,22 @@ def fetchAndParseIndexFile(options, isSouth, baseCurlCmd, outputFolder):
         # Append to the main index
         for frame in sorted(localFrameDict.keys()):
 
+            if options.type == 'fireball':
+                # This is a bugfix. Ensure that the fireball DEM has not just
+                # the same frame number, but also same timestamp as the ortho.
+                # Otherwise we may accidentally getting one from next day.
+                [imageDateString, imageTimeString] = \
+                                  icebridge_common.parseTimeStamps(localFrameDict[frame])
+                if frame not in orthoStamp:
+                    #logger.info("Missing ortho for fireball: " + localFrameDict[frame])
+                    continue
+                if abs(int(imageTimeString) - int(orthoStamp[frame])) > 1000:
+                    # Apparently a tolerance is needed. Use 10 seconds, so the number 1000.
+                    #logger.info("Will not use fireball DEM whose timestamp differs from ortho.")
+                    #logger.info("Fireball is: " + localFrameDict[frame])
+                    #logger.info("Ortho is:    " + orthoFrameDict[frame])
+                    continue
+                
             # Fetch from next day, unless already have a value. And don't fetch
             # frames not in the jpeg index.
             if len(dayVals) > 1 and options.type != 'jpeg':
@@ -447,13 +493,86 @@ def fetchAndParseIndexFile(options, isSouth, baseCurlCmd, outputFolder):
             urlDict[frame]   = localUrlDict[frame]
         
     # Write the combined index file
-    with open(parsedIndexPath, 'w') as f:
-        for frame in sorted(frameDict.keys()):
-            f.write(str(frame) + ', ' + frameDict[frame] + ', ' + urlDict[frame] + '\n')
+    icebridge_common.writeIndexFile(parsedIndexPath, frameDict, urlDict)
             
     return parsedIndexPath
 
+def lidarFilesInRange(lidarDict, lidarFolder, startFrame, stopFrame):
+    '''Fetch only lidar files for the given frame range. Do that as follows.   '''
+    '''For each ortho frame in [startFrame, stopFrame], find the lidar         '''
+    '''file with the closest timestamp. Collect them all.                      '''
+    '''Add the two neighboring ones, to help with finding lidar pairs later.   '''
+    
+    lidarList = []
+    for frame in sorted(lidarDict.keys()):
+        lidarList.append(lidarDict[frame])
+
+    orthoFolder = icebridge_common.getOrthoFolder(os.path.dirname(lidarFolder))
+    orthoIndexPath = icebridge_common.csvIndexFile(orthoFolder)
+    (orthoFrameDict, orthoUrlDict) = icebridge_common.readIndexFile(orthoIndexPath)
+    minLidarIndex = len(lidarList)
+    maxLidarIndex = 0
+    for frame in sorted(orthoFrameDict.keys()):
+        if ((frame < startFrame) or (frame > stopFrame) ): continue
+        orthoFrame = orthoFrameDict[frame]
+        matchingLidar = icebridge_common.findMatchingLidarFileFromList(orthoFrame, lidarList)
+
+        for index in range(len(lidarList)):
+            if lidarList[index] == matchingLidar:
+                if minLidarIndex > index:
+                    minLidarIndex = index
+                if maxLidarIndex < index:
+                    maxLidarIndex = index
+
+    # We will fetch neighboring lidar files as well
+    if minLidarIndex > 0:
+        minLidarIndex = minLidarIndex -1
+    if maxLidarIndex + 1 < len(lidarList):
+        maxLidarIndex = maxLidarIndex + 1
+
+    lidarsToFetch = set()
+    for index in range(minLidarIndex, maxLidarIndex+1):
+        lidarsToFetch.add(lidarList[index])
+
+    return lidarsToFetch
+
+
+def fetchNavData(options, outputFolder):
+    '''Fetch all the nav data for a flight.'''
+
+    numFailed = 0
+
+    # The storage convention for these is very easy!
+    # - A few dates have two files instead of one.
+    folderUrl = getFolderUrl(options.yyyymmdd, options.year, options.month,
+                             options.day, False,
+                             options.site, options.type)
+    filename  = 'sbet_' + options.yyyymmdd + '.out'
+    filenameA = 'sbet_' + options.yyyymmdd + 'a.out'
+    filenameB = 'sbet_' + options.yyyymmdd + 'b.out'
+    
+    # Check which urls are accurate for this file
+    url = folderUrl + filename
+    if checkIfUrlExists(url):
+        fileList = [filename]
+    else:
+        fileList = [filenameA, filenameB]
+
+    # Download the files    
+    for f in fileList:
+        url        = os.path.join(folderUrl, f)
+        outputPath = os.path.join(outputFolder, f)
+        # TODO: How to handle refetch?
+        if os.path.exists(outputPath):
+            continue
+        if not icebridge_common.fetchFile(url, outputPath):
+            numFailed = numFailed + 1
+
+    return numFailed
+
 def doFetch(options, outputFolder):
+    '''The main fetch function.
+       Returns the number of failures.'''
     
     # Verify that required files exist
     home = os.path.expanduser("~")
@@ -472,6 +591,10 @@ def doFetch(options, outputFolder):
     os.system('mkdir -p ' + outputFolder)  
 
     isSouth = (options.site == 'AN')
+    
+    if options.type == 'nav': # Nav fetching is much less complicated
+        return fetchNavData(options, outputFolder)
+    
     parsedIndexPath = fetchAndParseIndexFile(options, isSouth, baseCurlCmd, outputFolder)
     if not icebridge_common.fileNonEmpty(parsedIndexPath):
         # Some dirs are weird, both images, fireball dems, and ortho.
@@ -493,21 +616,34 @@ def doFetch(options, outputFolder):
     if options.stopAfterIndexFetch:
         return 0
     
-    allFrames  = sorted(frameDict.keys())
-    firstFrame = icebridge_common.getLargestFrame()    # start big
-    lastFrame  = icebridge_common.getSmallestFrame()   # start small
-    for frameNumber in allFrames:
-        if frameNumber < firstFrame:
-            firstFrame = frameNumber
-        if frameNumber > lastFrame:
-            lastFrame = frameNumber
-            
-    if options.allFrames:
-        options.startFrame = firstFrame
-        options.stopFrame  = lastFrame
-
     isLidar = (options.type in LIDAR_TYPES)
+
+    allFrames  = sorted(frameDict.keys())
     
+    if not isLidar:
+        # The lidar frames use a totally different numbering than the image/ortho/dem frames
+        firstFrame = icebridge_common.getLargestFrame()    # start big
+        lastFrame  = icebridge_common.getSmallestFrame()   # start small
+        for frameNumber in allFrames:
+            if frameNumber < firstFrame:
+                firstFrame = frameNumber
+            if frameNumber > lastFrame:
+                lastFrame = frameNumber
+
+        if options.allFrames:
+            options.startFrame = firstFrame
+            options.stopFrame  = lastFrame
+
+    if isLidar:
+        # Based on image frames, determine which lidar frames to fetch.
+        if options.ignoreMissingLidar and len(frameDict.keys()) == 0:
+            # Nothing we can do if this run has no lidar and we are told to continue
+            logger.info("Warning: missing lidar, but continuing.")
+            lidarsToFetch = set()
+        else:
+            lidarsToFetch = lidarFilesInRange(frameDict, outputFolder,
+                                              options.startFrame, options.stopFrame)
+        
     # There is always a chance that not all requested frames are available.
     # That is particularly true for Fireball DEMs. Instead of failing,
     # just download what is present and give a warning. 
@@ -533,9 +669,15 @@ def doFetch(options, outputFolder):
     numFetched = 0
     skipCount  = 0
     for frame in allFrames:
-        if ((frame < options.startFrame) or (frame > options.stopFrame) ) and not isLidar:
-            continue # Skip frames outside the range
 
+        # Skip frame outside of range
+        if isLidar:
+            if frameDict[frame] not in lidarsToFetch:
+                continue
+        else:       
+            if ((frame < options.startFrame) or (frame > options.stopFrame) ):
+                continue
+                
         # Handle the frame skip option
         if options.frameSkip > 0: 
             if skipCount < options.frameSkip:
@@ -569,9 +711,17 @@ def doFetch(options, outputFolder):
         allFilesToFetch = allFilesToFetch[0:options.maxNumLidarToFetch]
         allUrlsToFetch  = allUrlsToFetch [0:options.maxNumLidarToFetch]
                 
-    icebridge_common.fetchFilesInBatches(baseCurlCmd, MAX_IN_ONE_CALL, options.dryRun, outputFolder,
+    icebridge_common.fetchFilesInBatches(baseCurlCmd, MAX_IN_ONE_CALL, options.dryRun,
+                                         outputFolder,
                                          allFilesToFetch, allUrlsToFetch, logger)
 
+    # Fetch from disk the set of already validated files, if any
+    validFilesList = icebridge_common.validFilesList(os.path.dirname(outputFolder),
+                                                     options.startFrame, options.stopFrame)
+    validFilesSet = set()
+    validFilesSet = icebridge_common.updateValidFilesListFromDisk(validFilesList, validFilesSet)
+    numInitialValidFiles = len(validFilesSet)
+    
     # Verify that all files were fetched and are in good shape
     failedFiles = []
     for outputPath in allFilesToFetch:
@@ -585,66 +735,103 @@ def doFetch(options, outputFolder):
             continue
 
         if icebridge_common.hasImageExtension(outputPath):
-            if not icebridge_common.isValidImage(outputPath):
-                logger.info('Found an invalid image. Will wipe it: ' + outputPath)
-                if os.path.exists(outputPath): os.remove(outputPath)
-                failedFiles.append(outputPath)
-                continue
-            else:
-                logger.info('Valid image: ' + outputPath)
+            if False:
+                # This check is just so slow. Turn it off for now.
+                # This will impact only the validation of jpegs,
+                # as the other files can be validated via the checksum.
+                # Jpegs will be validated when converting them to 1 band images
+                if outputPath in validFilesSet and os.path.exists(outputPath):
+                    #logger.info('Previously validated: ' + outputPath)   # verbose
+                    continue
+                else:
+                    if not icebridge_common.isValidImage(outputPath):
+                        logger.info('Found an invalid image. Will wipe it: ' + outputPath)
+                        if os.path.exists(outputPath): os.remove(outputPath)
+                        failedFiles.append(outputPath)
+                        continue
+                    else:
+                        logger.info('Valid image: ' + outputPath)
+                        validFilesSet.add(outputPath) # mark it as validated
 
         # Sanity check: XML files must have the right latitude.
         if icebridge_common.fileExtension(outputPath) == '.xml':
-            if os.path.exists(outputPath):
-                try:
-                    latitude = icebridge_common.parseLatitude(outputPath)
-                except:
-                    # Corrupted file
-                    logger.info("Failed to parse latitude, will wipe: " + outputPath)
-                    if os.path.exists(outputPath): os.remove(outputPath)
-                    failedFiles.append(outputPath)
-                    
-                isGood = hasGoodLat(latitude, isSouth)
-                if not isGood:
-                    logger.info("Wiping XML file " + outputPath + " with bad latitude " + \
-                                str(latitude))
-                    os.remove(outputPath)
-                    imageFile = icebridge_common.xmlToImage(outputPath)
-                    if os.path.exists(imageFile):
-                        logger.info("Wiping TIF file " + imageFile + " with bad latitude " + \
-                                    str(latitude))
-                        os.remove(imageFile)
+            if outputPath in validFilesSet and os.path.exists(outputPath):
+                #logger.info('Previously validated: ' + outputPath) #verbose
+                continue
+            else:
+                if os.path.exists(outputPath):
+                    try:
+                        latitude = icebridge_common.parseLatitude(outputPath)
+                        logger.info('Valid file: ' + outputPath)
+                        validFilesSet.add(outputPath) # mark it as validated
+                    except:
+                        # Corrupted file
+                        logger.info("Failed to parse latitude, will wipe: " + outputPath)
+                        if os.path.exists(outputPath): os.remove(outputPath)
+                        failedFiles.append(outputPath)
+
+                    # On a second thought, don't wipe files with wrong latitude, as
+                    # next time we run fetch we will have to fetch them again.
+                    # Hopefully they will be ignored.
+                    #isGood = hasGoodLat(latitude, isSouth)
+                    #if not isGood:
+                    #    logger.info("Wiping XML file " + outputPath + " with bad latitude " + \
+                    #                str(latitude))
+                    #    os.remove(outputPath)
+                    #    imageFile = icebridge_common.xmlToImage(outputPath)
+                    #    if os.path.exists(imageFile):
+                    #        logger.info("Wiping TIF file " + imageFile + " with bad latitude " + \
+                    #                    str(latitude))
+                    #        os.remove(imageFile)
                     
         # Verify the chcksum    
         if hasXml and len(outputPath) >= 4 and outputPath[-4:] != '.xml' \
                and outputPath[-4:] != '.tfw':
-            isGood = icebridge_common.hasValidChkSum(outputPath, logger)
-            if not isGood:
-                xmlFile = icebridge_common.xmlFile(outputPath)
-                logger.info('Found invalid data. Will wipe it: ' + outputPath + ' ' + xmlFile)
-                if os.path.exists(outputPath): os.remove(outputPath)
-                if os.path.exists(xmlFile):    os.remove(xmlFile)
-                failedFiles.append(outputPath)
-                failedFiles.append(xmlFile)
+            if outputPath in validFilesSet and os.path.exists(outputPath):
+                #logger.info('Previously validated: ' + outputPath) # verbose
                 continue
             else:
-                logger.info('Valid file: ' + outputPath)
-
+                isGood = icebridge_common.hasValidChkSum(outputPath, logger)
+                if not isGood:
+                    xmlFile = icebridge_common.xmlFile(outputPath)
+                    logger.info('Found invalid data. Will wipe: ' + outputPath + ' ' + xmlFile)
+                    if os.path.exists(outputPath): os.remove(outputPath)
+                    if os.path.exists(xmlFile):    os.remove(xmlFile)
+                    failedFiles.append(outputPath)
+                    failedFiles.append(xmlFile)
+                    continue
+                else:
+                    logger.info('Valid file: ' + outputPath)
+                    validFilesSet.add(outputPath)
 
         if hasTfw and icebridge_common.fileExtension(outputPath) == '.tfw':
-            isGood = icebridge_common.isValidTfw(outputPath, logger)
-            if not isGood:
-                xmlFile = icebridge_common.xmlFile(outputPath)
-                logger.info('Found invalid tfw. Will wipe: ' + outputPath + ' ' + xmlFile)
-                if os.path.exists(outputPath): os.remove(outputPath)
-                if os.path.exists(xmlFile):    os.remove(xmlFile)
-                failedFiles.append(outputPath)
-                failedFiles.append(xmlFile)
+            if outputPath in validFilesSet and os.path.exists(outputPath):
+                #logger.info('Previously validated: ' + outputPath)
                 continue
             else:
-                logger.info('Valid tfw file: ' + outputPath)
-                
-            
+                isGood = icebridge_common.isValidTfw(outputPath, logger)
+                if not isGood:
+                    xmlFile = icebridge_common.xmlFile(outputPath)
+                    logger.info('Found invalid tfw. Will wipe: ' + outputPath + ' ' + xmlFile)
+                    if os.path.exists(outputPath): os.remove(outputPath)
+                    if os.path.exists(xmlFile):    os.remove(xmlFile)
+                    failedFiles.append(outputPath)
+                    failedFiles.append(xmlFile)
+                    continue
+                else:
+                    logger.info('Valid tfw file: ' + outputPath)
+                    validFilesSet.add(outputPath)
+
+    # Write to disk the list of validated files, but only if new
+    # validations happened.  First re-read that list, in case a
+    # different process modified it in the meantime, such as if two
+    # managers are running at the same time.
+    numFinalValidFiles = len(validFilesSet)
+    if numInitialValidFiles != numFinalValidFiles:
+        validFilesSet = \
+                      icebridge_common.updateValidFilesListFromDisk(validFilesList, validFilesSet)
+        icebridge_common.writeValidFilesList(validFilesList, validFilesSet)
+
     numFailed = len(failedFiles)
     if numFailed > 0:
         logger.info("Number of files that could not be processed: " + str(numFailed))
@@ -668,18 +855,21 @@ def main(argsIn):
                           help="Specify the year, month, and day in one YYYYMMDD string.")
         parser.add_option("--site",  dest="site", default=None,
                           help="Name of the location of the images (AN or GR)")
-        parser.add_option("--start-frame",  dest="startFrame", type='int', default=None,
+        parser.add_option("--start-frame",  dest="startFrame", type='int', 
+                          default=icebridge_common.getSmallestFrame(),
                           help="Frame number or start of frame sequence")
-        parser.add_option("--stop-frame",  dest="stopFrame", type='int', default=None,
+        parser.add_option("--stop-frame",  dest="stopFrame", type='int', 
+                          default=icebridge_common.getLargestFrame(),
                           help="End of frame sequence to download.")
-        parser.add_option("--all-frames", action="store_true", dest="allFrames", default=False,
+        parser.add_option("--all-frames", action="store_true", dest="allFrames", 
+                          default=False,
                           help="Fetch all frames for this flight.")
-        parser.add_option("--jpeg-folder",  dest="jpegFolder", default=None,
-                          help="The location of the jpeg folder. This is neeed to " +
-                          "fetch indices of ortho images and DEMs.")
         parser.add_option("--skip-validate", action="store_true", dest="skipValidate",
                           default=False,
                           help="Skip input data validation.")
+        parser.add_option("--ignore-missing-lidar", action="store_true", dest="ignoreMissingLidar",
+                          default=False,
+                          help="Keep going if the lidar is missing.")
         parser.add_option("--frame-skip",  dest="frameSkip", type='int', default=0,
                           help="Skip this many frames between downloads.")
         parser.add_option("--dry-run", action="store_true", dest="dryRun",
@@ -708,6 +898,7 @@ def main(argsIn):
         options.type = icebridge_common.folderToType(outputFolder)
         if options.type == 'lidar':
             options.type = LIDAR_TYPES[0]
+        print 'Detected type: ' + options.type
             
         # Handle unified date option
         if options.yyyymmdd:
@@ -728,7 +919,7 @@ def main(argsIn):
             logger.error('Error, site must be AN or GR for images.\n' + usage)
             return -1
 
-        KNOWN_TYPES = ['jpeg', 'ortho', 'fireball'] + LIDAR_TYPES
+        KNOWN_TYPES = ['jpeg', 'ortho', 'fireball', 'nav'] + LIDAR_TYPES
         if not (options.type.lower() in KNOWN_TYPES):
             logger.error('Error, type must be image, ortho, fireball, or a lidar type.\n' + usage)
             return -1

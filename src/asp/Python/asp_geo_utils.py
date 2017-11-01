@@ -22,7 +22,7 @@
 """
 
 import sys, os, glob, re, shutil, subprocess, string, time, errno
-
+import subprocess32
 import asp_string_utils, asp_image_utils, asp_system_utils
 
 def getGdalInfoTagValue(text, tag):
@@ -91,8 +91,6 @@ def getImageGeoInfo(imagePath, getStats=True):
         outputDict['projection'] = 'EQUIRECTANGULAR'
     elif '+proj=ster' in textOutput:
         outputDict['projection'] = 'POLAR STEREOGRAPHIC'
-    
-    
     
     # Extract this variable which ASP inserts into its point cloud files
     try:
@@ -457,7 +455,18 @@ def build_vrt( fullImageSize, tileLocs, tilePaths, outputPath ):
     f.write("</VRTDataset>\n")
     f.close()    
     
-    
+
+def convertCoords(x, y, projStringIn, projStringOut):
+    '''Convert coordinates from one projection to another'''
+
+    # Using subprocess32 to access the timeout argument which is not always present in subprocess
+    cmd = [asp_system_utils.which('gdaltransform'), '-s_srs', projStringIn, '-t_srs', projStringOut]
+    #print(" ".join(cmd))
+    p = subprocess32.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, shell=False)
+    textOutput, err = p.communicate( ('%f %f\n' % (x, y)), timeout=0.5 )
+    parts = textOutput.split()
+
+    return ( float(parts[0]), float(parts[1]) )
     
 
     

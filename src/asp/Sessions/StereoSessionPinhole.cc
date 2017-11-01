@@ -235,6 +235,24 @@ void asp::StereoSessionPinhole::pre_preprocessing_hook(bool adjust_left_image_si
 namespace asp {
 
 
+void asp::StereoSessionPinhole::get_unaligned_camera_models(
+                                 boost::shared_ptr<vw::camera::CameraModel> &left_cam,
+                                 boost::shared_ptr<vw::camera::CameraModel> &right_cam) {
+                                 
+  // Retrieve the pixel offset (if any) to cropped images
+  vw::Vector2 left_pixel_offset  = camera_pixel_offset(m_input_dem, m_left_image_file,
+                                                       m_right_image_file, m_left_image_file);
+  vw::Vector2 right_pixel_offset = camera_pixel_offset(m_input_dem, m_left_image_file,
+                                                       m_right_image_file, m_right_image_file);
+
+  // Load the camera models adjusted for cropping
+  left_cam  = load_adjusted_model(vw::camera::load_pinhole_camera_model(m_left_camera_file),
+                                  m_left_image_file, m_left_camera_file, left_pixel_offset);
+  right_cam = load_adjusted_model(vw::camera::load_pinhole_camera_model(m_right_camera_file),
+                                  m_right_image_file, m_right_camera_file, right_pixel_offset);                                 
+}
+
+
 boost::shared_ptr<vw::camera::CameraModel>
 load_adj_pinhole_model(std::string const& image_file,       std::string const& camera_file,
                        std::string const& left_image_file,  std::string const& right_image_file,
@@ -382,4 +400,25 @@ asp::StereoSessionPinhole::tx_right() const {
     return tx_type( align_matrix );
   }
   return tx_type( math::identity_matrix<3>() );
+}
+
+// TODO: Need tx_left to return a pointer, and then the logic of the function below
+// needs to be incorporated into tx_left(). This because for epipolar alignment
+// the camera transform type is not a homography transform.
+void asp::StereoSessionPinhole::pinhole_cam_trans(asp::PinholeCamTrans & left_trans,
+                                                  asp::PinholeCamTrans & right_trans){
+
+  // Load the epipolar aligned camera models
+  boost::shared_ptr<camera::CameraModel> left_aligned_model, right_aligned_model;
+  this->camera_models(left_aligned_model, right_aligned_model);
+  
+  boost::shared_ptr<camera::CameraModel> left_input_model, right_input_model;
+  this->get_unaligned_camera_models(left_input_model, right_input_model);
+
+  // Set up transform objects
+  typedef vw::camera::PinholeModel PinModel;
+  left_trans = asp::PinholeCamTrans(*dynamic_cast<PinModel*>(&(*left_input_model )), *dynamic_cast<PinModel*>(&(*left_aligned_model )));
+
+  right_trans = asp::PinholeCamTrans(*dynamic_cast<PinModel*>(&(*right_input_model )), *dynamic_cast<PinModel*>(&(*right_aligned_model )));
+
 }

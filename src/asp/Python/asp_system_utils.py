@@ -252,7 +252,7 @@ def run_and_parse_output(cmd, args, sep, verbose, **kw ):
     call.extend(args)
 
     if verbose:
-        print(" ".join(call))
+        print asp_string_utils.argListToString(call) 
 
     try:
         p = subprocess.Popen(call, stdout=subprocess.PIPE)
@@ -285,14 +285,14 @@ def run_and_parse_output(cmd, args, sep, verbose, **kw ):
     return data
 
 def run_with_return_code(cmd, verbose=False):
-    
+    # TODO: Wipe this and use instead executeCommand.
     if verbose:
-        print(" ".join(cmd))
+        print asp_string_utils.argListToString(cmd) 
 
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     except OSError as e:
-        print('Error: %s: %s' % (" ".join(cmd), e))
+        print('Error: %s: %s' % ( asp_string_utils.argListToString(cmd), e))
         
     (stdout, stderr) = p.communicate()
     p.wait()
@@ -304,52 +304,81 @@ def run_with_return_code(cmd, verbose=False):
 
     return p.returncode
 
-def run_return_outputs(cmd, verbose=False):
-    '''Start a process. Wait until it finishes. Return the exit
-    status, output, and error. If any of these are None, convert them
-    to empty strings to make them easier to use.'''
-    if verbose:
-        print(" ".join(cmd))
-
-    try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except OSError as e:
-        print('Error: %s: %s' % (" ".join(cmd), e))
-        
-    (stdout, stderr) = p.communicate()
-    p.wait()
-    status = p.returncode
-    
-    if stdout is None: stdout = ""
-    if stderr is None: stderr = ""
-        
-    return (status, stdout, stderr)
-
 # TODO: Improve this function a bit
 def executeCommand(cmd,
                    outputPath=None,      # If given, throw if the file is not created.  Don't run if it already exists.
                    suppressOutput=False, # If true, don't print anything!
-                   redo=False):          # If true, run even if outputPath already exists.
+                   redo=False,           # If true, run even if outputPath already exists.
+                   noThrow=False,        # If true, don't throw if output is missing
+                   numAttempts = 1,         # How many attempts to use
+                   sleepTime = 60        # How much to sleep between attempts
+                   ):
     '''Executes a command with multiple options'''
 
+    
+    # Initialize outputs
+    out    = ""
+    status = 0
+    err    = ""
+    
     if cmd == '': # An empty task
-        return False
+        return (out, err, status)
 
     # Convert the input to list format if needed
     if not asp_string_utils.isNotString(cmd):
         cmd = asp_string_utils.stringToArgList(cmd)
 
-    # Run the command if conditions are met
-    if redo or (not outputPath) or (not os.path.exists(outputPath)):
+    for attempt in range(numAttempts):
+        
+        # Run the command if conditions are met
+        if redo or (outputPath is None) or (not os.path.exists(outputPath)):
 
-        if suppressOutput: # Process silently
-            FNULL = open(os.devnull, 'w')
-            subprocess.call(cmd, stdout=FNULL, stderr=subprocess.STDOUT)
-        else: # Display output, taking care of quotes
-            print asp_string_utils.argListToString(cmd) 
-            subprocess.call(cmd)
+            if not suppressOutput:
+                print asp_string_utils.argListToString(cmd)
 
-    # Optionally check that the output file was created
-    if outputPath and (not os.path.exists(outputPath)):
-        raise asp_cmd_utils.CmdRunException('Failed to create output file: ' + outputPath)
-    return True
+            try:
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out, err = p.communicate()
+                status = p.returncode
+            except OSError as e:
+                out = ""
+                err = ('Error: %s: %s' % (asp_string_utils.argListToString(cmd), e))
+                status = 1
+                if not noThrow:
+                    raise Exception(err)
+
+            if out is None: out = ""
+            if err is None: err = ""
+
+            if not suppressOutput:
+                print out + '\n' + err
+
+            if status == 0:
+                break
+
+            if numAttempts <= 1:
+                break
+
+            if attempt < numAttempts - 1:
+                print("attempt: " + str(attempt))
+                print("ran: " + asp_string_utils.argListToString(cmd) )
+                print("out = " + out)
+                print("err = " + err)
+                print("status = " + str(status))
+                print("Will sleep for " + str(sleepTime) + " seconds")
+
+                time.sleep(sleepTime)
+        
+        else: # Output file already exists, don't re-run
+            out    = ""
+            err    = ""
+            status = 0
+
+        # Optionally check that the output file was created
+        if outputPath and (not os.path.exists(outputPath)) and (not noThrow):
+            raise asp_cmd_utils.CmdRunException('Failed to create output file: ' + outputPath)
+
+    return (out, err, status)
+    
+    
+    

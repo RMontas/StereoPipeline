@@ -52,14 +52,14 @@ os.environ["PATH"] = binpath        + os.pathsep + os.environ["PATH"]
 
 
 def fetchAllRunData(options, startFrame, stopFrame, 
-                    jpegFolder, orthoFolder, fireballFolder, lidarFolder):
+                    jpegFolder, orthoFolder, fireballFolder, lidarFolder, navFolder):
     '''Download all data needed to process a run'''
     
     logger = logging.getLogger(__name__)
     logger.info('Downloading data for the run...')
 
-    baseCommand = (('--yyyymmdd %s --site %s --start-frame %d --stop-frame %d --jpeg-folder %s')
-                   % (options.yyyymmdd, options.site, startFrame, stopFrame, jpegFolder))
+    baseCommand = (('--yyyymmdd %s --site %s --start-frame %d --stop-frame %d')
+                   % (options.yyyymmdd, options.site, startFrame, stopFrame))
 
     if options.maxNumLidarToFetch is not None and options.maxNumLidarToFetch >= 0:
         baseCommand += ' --max-num-lidar-to-fetch ' + str(options.maxNumLidarToFetch)
@@ -71,6 +71,8 @@ def fetchAllRunData(options, startFrame, stopFrame,
         baseCommand += ' --stop-after-index-fetch' 
     if options.skipValidate:
         baseCommand += ' --skip-validate'
+    if options.ignoreMissingLidar:
+        baseCommand += ' --ignore-missing-lidar'
     if options.dryRun:
         baseCommand += ' --dry-run'
 
@@ -78,8 +80,7 @@ def fetchAllRunData(options, startFrame, stopFrame,
     orthoCommand     = baseCommand + ' ' + orthoFolder
     fireballCommand  = baseCommand + ' ' + fireballFolder
     lidarCommand     = baseCommand + ' ' + lidarFolder
-
-    # TODO: Handle runs without DEM or ORTHO data.
+    navCommand       = baseCommand + ' ' + navFolder
     
     # Try to do all the downloads one after another
     # - On a failure the error message should already be printed.
@@ -89,7 +90,10 @@ def fetchAllRunData(options, startFrame, stopFrame,
     if fetch_icebridge_data.main(orthoCommand.split()) < 0:
         return -1
     if fetch_icebridge_data.main(fireballCommand.split()) < 0:
-        print 'Fireball DEM data is optional, continuing run.'
+        logger.info('Fireball DEM data is optional, continuing run.')
+    if not options.noNavFetch:
+        if fetch_icebridge_data.main(navCommand.split()) < 0:
+            return -1
     # Skip the lidar fetch if the user requested no lidar files
     if (options.maxNumLidarToFetch is None) or (options.maxNumLidarToFetch > 0):
         if fetch_icebridge_data.main(lidarCommand.split()) < 0:
@@ -105,11 +109,19 @@ def fetchAllRunData(options, startFrame, stopFrame,
         (orthoFrameDict, orthoUrlDict) = icebridge_common.readIndexFile(orthoIndex)
         
         for jpegFrame in jpegFrameDict.keys():
+            
+            if jpegFrame < startFrame or jpegFrame > stopFrame:
+                continue
+            
             if jpegFrame not in orthoFrameDict.keys():
                 logger.info("Found jpeg frame missing from ortho: " + str(jpegFrame))
                 #raise Exception ("Found jpeg frame missing from ortho:" + str(jpegFrame))
 
         for orthoFrame in orthoFrameDict.keys():
+
+            if orthoFrame < startFrame or orthoFrame > stopFrame:
+                continue
+            
             if orthoFrame not in jpegFrameDict.keys():
                 # This can happen, don't die because of it
                 logger.info("Found ortho frame missing from jpeg: " + str(orthoFrame))
@@ -119,33 +131,229 @@ def fetchAllRunData(options, startFrame, stopFrame,
     
     return (jpegFolder, orthoFolder, fireballFolder, lidarFolder)
 
-def processTheRun(imageFolder, cameraFolder, lidarFolder, orthoFolder, fireballFolder, processFolder,
-                  isSouth, bundleLength, referenceDem, stereoArgs,
-                  startFrame, stopFrame, logBatches,
-                  numProcesses, numThreads, numProcessesPerBatch):
+def validateOrthosAndFireball(options, fileType, logger):
+    '''Validate ortho and fireball files within the current frame range. This
+    is expected to be in called in parallel for smaller chunks. Lidar files
+    will be validated serially. Jpegs get validated when converted to tif.
+    Return True if all is good.'''
+
+    badFiles = False
+    logger.info("Validating files of type: " + fileType)
+    
+    if fileType   == 'ortho':
+        dataFolder = icebridge_common.getOrthoFolder(options.outputFolder)
+    elif fileType == 'fireball':
+        dataFolder = icebridge_common.getFireballFolder(options.outputFolder)
+    else:
+        raise Exception("Unknown file type: " + fileType)
+
+    indexPath = icebridge_common.csvIndexFile(dataFolder)
+    if not os.path.exists(indexPath):
+        # The issue of what to do when the index does not exist should
+        # have been settled by now.
+        return (not badFiles)
+
+    # Fetch from disk the set of already validated files, if any
+    validFilesList = icebridge_common.validFilesList(options.outputFolder,
+                                                     options.startFrame, options.stopFrame)
+    validFilesSet = set()
+    validFilesSet = icebridge_common.updateValidFilesListFromDisk(validFilesList, validFilesSet)
+    numInitialValidFiles = len(validFilesSet)
+    
+    (frameDict, urlDict) = icebridge_common.readIndexFile(indexPath, prependFolder = True)
+    for frame in frameDict.keys():
+
+        if frame < options.startFrame or frame > options.stopFrame:
+            continue
+
+        outputPath = frameDict[frame]
+        xmlFile = icebridge_common.xmlFile(outputPath)
+
+        if outputPath in validFilesSet and os.path.exists(outputPath) and \
+            xmlFile in validFilesSet and os.path.exists(xmlFile):
+            #logger.info('Previously validated: ' + outputPath + ' ' + xmlFile)
+            continue
+        else:
+            isGood = icebridge_common.hasValidChkSum(outputPath, logger)
+            if not isGood:
+                logger.info('Found invalid data. Will wipe: ' + outputPath + ' ' + xmlFile)
+                os.system('rm -f ' + outputPath) # will not throw
+                os.system('rm -f ' + xmlFile) # will not throw
+                badFiles = True
+            else:
+                logger.info('Valid file: ' + outputPath)
+                validFilesSet.add(outputPath)
+                validFilesSet.add(xmlFile)
+            
+        if fileType != 'fireball':
+            continue
+
+        # Also validate tfw
+        tfwFile = icebridge_common.tfwFile(outputPath)
+        xmlFile = icebridge_common.xmlFile(tfwFile)
+        if tfwFile in validFilesSet and os.path.exists(tfwFile) and \
+            xmlFile in validFilesSet and os.path.exists(xmlFile):
+            #logger.info('Previously validated: ' + tfwFile + ' ' + xmlFile)
+            continue
+        else:
+            isGood = icebridge_common.isValidTfw(tfwFile, logger)
+            if not isGood:
+                logger.info('Found invalid tfw. Will wipe: ' + tfwFile + ' ' + xmlFile)
+                os.system('rm -f ' + tfwFile) # will not throw
+                os.system('rm -f ' + xmlFile) # will not throw
+                badFiles = True
+            else:
+                logger.info('Valid tfw file: ' + tfwFile)
+                validFilesSet.add(tfwFile)
+                validFilesSet.add(xmlFile)
+        
+    # Write to disk the list of validated files, but only if new
+    # validations happened.  First re-read that list, in case a
+    # different process modified it in the meantime, such as if two
+    # managers are running at the same time.
+    numFinalValidFiles = len(validFilesSet)
+    if numInitialValidFiles != numFinalValidFiles:
+        validFilesSet = \
+                      icebridge_common.updateValidFilesListFromDisk(validFilesList, validFilesSet)
+        icebridge_common.writeValidFilesList(validFilesList, validFilesSet)
+
+    return (not badFiles)
+    
+def runFetchConvert(options, isSouth, cameraFolder, imageFolder, jpegFolder, orthoFolder,
+                    fireballFolder, corrFireballFolder, lidarFolder, processedFolder,
+                    navFolder, navCameraFolder, refDemPath, logger):
+    '''Fetch and/or convert. Return 0 on success.'''
+
+    if options.noFetch:
+        logger.info('Skipping fetch.')
+    else:
+        # Call data fetch routine and check the result
+        fetchResult = fetchAllRunData(options, options.startFrame, options.stopFrame,
+                                      jpegFolder, orthoFolder, fireballFolder, lidarFolder,
+                                      navFolder)
+        if fetchResult < 0:
+            logger.error("Fetching failed!") 
+            return -1
+
+        # This step is slow, so run it here as part of fetching and save its result
+        # We certainly don't want it to throw any exception at this stage.
+        try:
+            forceAllFramesInRange = True
+            availableFrames = []
+            (autoStereoInterval, breaks) = \
+                                 process_icebridge_run.getImageSpacing(orthoFolder, availableFrames,
+                                                                       options.startFrame,
+                                                                       options.stopFrame,
+                                                                       forceAllFramesInRange)
+        except Exception, e:
+            pass
+        
+    if options.stopAfterFetch or options.dryRun:
+        logger.info('Fetching complete, finished!')
+        return 0
+
+    # Keep track of how we are doing
+    isGood = True
+    
+    if options.noConvert:        
+        logger.info('Skipping convert.')
+    else:
+
+        # When files fail in these conversion functions we log the error and keep going
+
+        if not options.skipFastConvert:
+
+            if not options.skipValidate:
+                # Validate orthos and dems for this frame range.
+                ans = validateOrthosAndFireball(options, 'ortho', logger)
+                isGood = (isGood and ans)
+                ans = validateOrthosAndFireball(options, 'fireball', logger)
+                isGood = (isGood and ans)
+            
+            # Run non-ortho conversions without any multiprocessing (they are pretty fast)
+            # TODO: May be worth doing the faster functions with multiprocessing in the future
+
+            if not options.noLidarConvert:
+                ans = input_conversions.convertLidarDataToCsv(lidarFolder,
+                                                              options.startFrame, options.stopFrame,
+                                                              options.skipValidate,
+                                                              logger)
+                isGood = (isGood and ans)
+                
+                ans = input_conversions.pairLidarFiles(lidarFolder, options.skipValidate, logger)
+                isGood = (isGood and ans)
+                
+            ans = input_conversions.correctFireballDems(fireballFolder, corrFireballFolder,
+                                                        options.startFrame, options.stopFrame,
+                                                        (not isSouth), options.skipValidate,
+                                                        logger)
+            isGood = (isGood and ans)
+
+            ans = input_conversions.convertJpegs(jpegFolder, imageFolder, 
+                                                 options.startFrame, options.stopFrame,
+                                                 options.skipValidate, logger)
+            isGood = (isGood and ans)
+            
+        if not options.noNavFetch:
+            # Single process call to parse the nav files.
+            input_conversions.getCameraModelsFromNav(imageFolder, orthoFolder, 
+                                                     options.inputCalFolder, navFolder,
+                                                     navCameraFolder,
+                                                     options.startFrame, options.stopFrame,
+                                                     logger)
+        else:
+            navCameraFolder = ""
+            
+        if not options.noOrthoConvert:
+            # Multi-process call to convert ortho images
+            input_conversions.getCameraModelsFromOrtho(imageFolder, orthoFolder,
+                                                       options.inputCalFolder, 
+                                                       options.cameraLookupFile,
+                                                       navCameraFolder,
+                                                       options.yyyymmdd, options.site, 
+                                                       refDemPath, cameraFolder, 
+                                                       options.simpleCameras,
+                                                       options.startFrame, options.stopFrame,
+                                                       options.framesFile,
+                                                       options.numOrthoProcesses, options.numThreads,
+                                                       logger)
+
+
+    if isGood:
+        return 0
+
+    return -1
+    
+def processTheRun(options, imageFolder, cameraFolder, lidarFolder, orthoFolder,
+                  fireballFolder, processedFolder, isSouth, referenceDem):
+    
     '''Do all the run processing'''
 
     # Some care is taken with the --stereo-arguments argument to make sure it is passed correctly.
     processCommand = (('%s %s %s %s --bundle-length %d --fireball-folder %s ' +
                        '--ortho-folder %s --num-processes %d --num-threads %d ' +
                        '--num-processes-per-batch %d --reference-dem %s')
-                      % (imageFolder, cameraFolder, lidarFolder, processFolder,
-                         bundleLength, fireballFolder, orthoFolder, numProcesses,
-                         numThreads, numProcessesPerBatch, referenceDem))
+                      % (imageFolder, cameraFolder, lidarFolder, processedFolder,
+                         options.bundleLength, fireballFolder, orthoFolder, options.numProcesses,
+                         options.numThreads, options.numProcessesPerBatch, referenceDem))
     if isSouth:
         processCommand += ' --south'
-    if startFrame:
-        processCommand += ' --start-frame ' + str(startFrame)
-    if stopFrame:
-        processCommand += ' --stop-frame ' + str(stopFrame)
-    if logBatches:
+    if options.startFrame:
+        processCommand += ' --start-frame ' + str(options.startFrame)
+    if options.stopFrame:
+        processCommand += ' --stop-frame ' + str(options.stopFrame)
+    if options.logBatches:
         processCommand += ' --log-batches'
+    if options.cleanup:
+        processCommand += ' --cleanup'
+        
     processCommand += ' --stereo-arguments '
 
     logger = logging.getLogger(__name__)
-    logger.info('Process command: process_icebridge_run ' + processCommand + stereoArgs.strip())
+    logger.info('Process command: process_icebridge_run ' +
+                processCommand + options.stereoArgs.strip())
     args = processCommand.split()
-    args += (stereoArgs.strip(),) # Make sure this is properly passed
+    args += (options.stereoArgs.strip(),) # Make sure this is properly passed
     process_icebridge_run.main(args)
 
 def main(argsIn):
@@ -188,7 +396,10 @@ def main(argsIn):
                           type=int, help="The number of images to treat as overlapping for " + \
                           "bundle adjustment.")
         
-        parser.add_argument('--stereo-arguments', dest='stereoArgs', default='--stereo-algorithm 2',
+        parser.add_argument('--stereo-arguments', dest='stereoArgs',
+                            # set --min-xcorr-level 0 to do the left-to-right 
+                            # and right-to-left consistency check at the lowest level.
+                            default='--stereo-algorithm 2 --min-xcorr-level 0',
                             help='Extra arguments to pass to stereo.')
 
         parser.add_argument('--start-frame', dest='startFrame', type=int,
@@ -198,6 +409,9 @@ def main(argsIn):
         parser.add_argument('--stop-frame', dest='stopFrame', type=int,
                           default=icebridge_common.getLargestFrame(),
                           help='Frame to stop on.')
+        parser.add_argument('--frames-file', dest='framesFile', default="",
+                            help='Specific frames to run ortho2pinhole on within this frame range.')
+
         parser.add_argument('--max-num-lidar-to-fetch', dest='maxNumLidarToFetch', default=None,
                           type=int, help="The maximum number of lidar files to fetch. " + \
                           "This is used in debugging.")
@@ -210,6 +424,9 @@ def main(argsIn):
         parser.add_argument("--processing-subfolder",  dest="processingSubfolder", default=None,
                           help="Specify a subfolder name where the processing outputs will go. " + \
                           "fault is no additional folder")
+                          
+        parser.add_argument("--simple-cameras", action="store_true", dest="simpleCameras", default=False,
+                          help="Don't use orthoimages to refine the camera models.")
 
         # Performance options  
         parser.add_argument('--num-processes', dest='numProcesses', default=1,
@@ -234,13 +451,17 @@ def main(argsIn):
                           default=False,
                           help="Stop program after data conversion.")
         parser.add_argument("--skip-validate", action="store_true", dest="skipValidate",
-                          default=False,
-                          help="Skip input data validation.")
+                            default=False,
+                            help="Skip input data validation.")
+        parser.add_argument("--ignore-missing-lidar", action="store_true", dest="ignoreMissingLidar",
+                            default=False,
+                            help="Keep going if the lidar is missing.")
         parser.add_argument("--log-batches", action="store_true", dest="logBatches", default=False,
                           help="Log the required batch commands without running them.")
+        parser.add_argument('--cleanup', action='store_true', default=False, dest='cleanup',  
+                          help='If the final result is produced delete intermediate files.')
         parser.add_argument("--dry-run", action="store_true", dest="dryRun", default=False,
                           help="Set up the input directories but do not fetch/process any imagery.")
-
 
         parser.add_argument("--refetch", action="store_true", dest="reFetch", default=False,
                           help="Try fetching again if some files turned out invalid " + \
@@ -251,6 +472,9 @@ def main(argsIn):
         parser.add_argument("--stop-after-index-fetch", action="store_true",
                           dest="stopAfterIndexFetch", default=False,
                           help="Stop after fetching the indices.")
+
+        parser.add_argument("--no-nav", action="store_true", dest="noNavFetch",
+                            default=False, help="Don't fetch or convert the nav data.")
                        
         parser.add_argument("--no-lidar-convert", action="store_true", dest="noLidarConvert",
                           default=False,
@@ -267,6 +491,8 @@ def main(argsIn):
     except argparse.ArgumentError, msg:
         parser.error(msg)
 
+    icebridge_common.switchWorkDir()
+    
     if options.numOrthoProcesses < 0:
         options.numOrthoProcesses = options.numProcesses
         
@@ -295,120 +521,74 @@ def main(argsIn):
         options.stopAfterFetch = True
         
     os.system('mkdir -p ' + options.outputFolder)
-    logLevel = logging.INFO # Make this an option??
+    logLevel = logging.INFO # Record everything
     logger   = icebridge_common.setUpLogger(options.outputFolder, logLevel,
-                                            'icebridge_processing_log')
+                                            'icebridge_processing_log_frames_' + str(options.startFrame) + "_" + str(options.stopFrame))
 
-    (status, out, err) = asp_system_utils.run_return_outputs(['uname', '-a'], verbose=False)
+    # Make sure we later know what we were doing
+    logger.info("full_processing_script.py " + " ".join(argsIn)) 
+                
+    (out, err, status) = asp_system_utils.executeCommand(['uname', '-a'],
+                                                         suppressOutput = True)
     logger.info("Running on machine: " + out)
+    logger.info("Work dir is " + os.getcwd())
+
+    os.system("ulimit -c 0") # disable core dumps
+    os.system("umask 022")   # enforce files be readable by others
     
     # Perform some input checks and initializations
-    if not (options.noOrthoConvert and (options.stopAfterConvert or options.stopAfterFetch) ):
-        # These are not needed unless cameras are initialized 
-        if options.inputCalFolder is None or not os.path.exists(options.inputCalFolder):
-            raise Exception("Missing camera calibration folder.")
-        if options.refDemFolder is None or not os.path.exists(options.refDemFolder):
-            raise Exception("Missing reference DEM folder.")
-
-        refDemName = icebridge_common.getReferenceDemName(options.site)
-        refDemPath = os.path.join(options.refDemFolder, refDemName)
-        if not os.path.exists(refDemPath):
-            raise Exception("Missing reference DEM: " + refDemPath)
-
-    # Set up the output folders
-    cameraFolder       = os.path.join(options.outputFolder, 'camera')
-    imageFolder        = os.path.join(options.outputFolder, 'image')
-    jpegFolder         = os.path.join(options.outputFolder, 'jpeg')
-    orthoFolder        = os.path.join(options.outputFolder, 'ortho')
-    fireballFolder     = os.path.join(options.outputFolder, 'fireball')
-    corrFireballFolder = os.path.join(options.outputFolder, 'corr_fireball')
-    lidarFolder        = os.path.join(options.outputFolder, 'lidar') # Paired files go in /paired
-    processFolder      = os.path.join(options.outputFolder, 'processed')
+    # These are not needed unless cameras are initialized 
+    if options.inputCalFolder is None or not os.path.exists(options.inputCalFolder):
+        raise Exception("Missing camera calibration folder.")
+    if options.refDemFolder is None or not os.path.exists(options.refDemFolder):
+        raise Exception("Missing reference DEM folder.")
     
+    refDemName = icebridge_common.getReferenceDemName(options.site)
+    refDemPath = os.path.join(options.refDemFolder, refDemName)
+    if not os.path.exists(refDemPath):
+        raise Exception("Missing reference DEM: " + refDemPath)
+    
+    # TODO: CLEAN UP!!!
+    # Set up the output folders
+    cameraFolder       = icebridge_common.getCameraFolder(options.outputFolder)
+    imageFolder        = icebridge_common.getImageFolder(options.outputFolder)
+    jpegFolder         = icebridge_common.getJpegFolder(options.outputFolder)
+    orthoFolder        = icebridge_common.getOrthoFolder(options.outputFolder)
+    fireballFolder     = icebridge_common.getFireballFolder(options.outputFolder)
+    corrFireballFolder = icebridge_common.getCorrFireballFolder(options.outputFolder)
+    lidarFolder        = icebridge_common.getLidarFolder(options.outputFolder)
+    processedFolder    = icebridge_common.getProcessedFolder(options.outputFolder)
+    navFolder          = icebridge_common.getNavFolder(options.outputFolder)
+    navCameraFolder    = icebridge_common.getNavCameraFolder(options.outputFolder)
+
     # Handle subfolder option.  This is useful for comparing results with different parameters!
     if options.processingSubfolder:
-        processFolder = os.path.join(processFolder, options.processingSubfolder)
+        processedFolder = os.path.join(processedFolder, options.processingSubfolder)
         logger.info('Will write to processing subfolder: ' + options.processingSubfolder)
        
-    if options.noFetch:
-        logger.info('Skipping fetch.')
-    else:
-        # Call data fetch routine and check the result
-        fetchResult = fetchAllRunData(options, options.startFrame, options.stopFrame,
-                                      jpegFolder, orthoFolder, fireballFolder, lidarFolder)
-        if fetchResult < 0:
-            logger.error("Fetching failed, quitting the program!") 
-            return -1
-           
-    if options.stopAfterFetch or options.dryRun:
-        logger.info('Fetching complete, finished!')
+    # If something failed in the first attempt either in fetch or in
+    # convert, we will wipe bad files, and try to refetch/re-convert.
+    numAttempts = 1
+    if options.reFetch and (not options.noFetch):
+        numAttempts = 2
+    
+    for attempt in range(numAttempts):
+        if numAttempts > 1:
+            logger.info("Fetch/convert attempt: " + str(attempt+1))
+        ans = runFetchConvert(options, isSouth, cameraFolder, imageFolder, jpegFolder, orthoFolder,
+                              fireballFolder, corrFireballFolder, lidarFolder, processedFolder,
+                              navFolder, navCameraFolder, refDemPath, logger)
+        if ans == 0:
+            break
+        
+    if options.stopAfterFetch or options.dryRun or options.stopAfterConvert:
+        logger.info('Fetch/convert finished!')
         return 0
-
-    if options.noConvert:        
-        logger.info('Skipping convert.')
-    else:
-
-        # When files fail in these conversion functions we log the error and keep going
-
-        if not options.skipFastConvert:
-
-            # Run non-ortho conversions without any multiprocessing (they are pretty fast)
-            # TODO: May be worth doing the faster functions with multiprocessing in the future
-
-            if not options.noLidarConvert:
-                input_conversions.convertLidarDataToCsv(lidarFolder, logger)
-                input_conversions.pairLidarFiles(lidarFolder, logger)
-         
-            input_conversions.correctFireballDems(fireballFolder, corrFireballFolder,
-                                                  options.startFrame, options.stopFrame,
-                                                  (not isSouth), options.skipValidate,
-                                                  logger)
-
-            isGood = input_conversions.convertJpegs(jpegFolder, imageFolder, 
-                                                    options.startFrame, options.stopFrame,
-                                                    options.skipValidate, logger)
-            if not isGood:
-                if options.reFetch and (not options.noFetch):
-                    # During conversion we may realize some data is bad. 
-                    logger.error("Cconversions failed. Trying to re-fetch problematic files.")
-                    fetchResult = fetchAllRunData(options, options.startFrame, options.stopFrame,
-                                                  jpegFolder, orthoFolder, fireballFolder,
-                                                  lidarFolder)
-                    if fetchResult < 0:
-                        logger.error("Fetching failed, quitting the program!")
-                        return -1
-                    isGood = input_conversions.convertJpegs(jpegFolder, imageFolder, 
-                                                            options.startFrame, options.stopFrame,
-                                                            options.skipValidate, logger)
-                    if not isGood:
-                        logger.error("Jpeg conversions failed, quitting the program!") 
-                        return -1
-                    
-                else:
-                    logger.error("Jpeg conversions failed, quitting the program!")
-                    return -1
-
-        if not options.noOrthoConvert:
-            # Multi-process call to convert ortho images
-            input_conversions.getCameraModelsFromOrtho(imageFolder, orthoFolder,
-                                                       options.inputCalFolder, 
-                                                       options.cameraLookupFile,
-                                                       options.yyyymmdd, options.site, 
-                                                       refDemPath, cameraFolder, 
-                                                       options.startFrame, options.stopFrame,
-                                                       options.numOrthoProcesses, options.numThreads,
-                                                       logger)
-    if options.stopAfterConvert:
-        print 'Conversion complete, finished!'
-        return 0
-
+    
     # Call the processing routine
-    processTheRun(imageFolder, cameraFolder, lidarFolder, orthoFolder,
-                  corrFireballFolder, processFolder,
-                  isSouth, options.bundleLength, refDemPath, options.stereoArgs,
-                  options.startFrame, options.stopFrame, options.logBatches,
-                  options.numProcesses, options.numThreads, options.numProcessesPerBatch)
-
+    processTheRun(options, imageFolder, cameraFolder, lidarFolder, orthoFolder,
+                  corrFireballFolder, processedFolder,
+                  isSouth, refDemPath)
    
 
 # Run main function if file used from shell

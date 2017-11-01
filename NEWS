@@ -15,6 +15,9 @@
    * Improved search range estimation in nadir epipolar 
      alignment cases. Added --elevation-limit option to
      help constrain this search range.
+   * Added hybrid SGM/MGM stereo option.
+   * Improvements to SGM search range estimation.
+   * Added --min-num-ip option.
    
  - bundle_adjust
    * The tool is a lot more sensitive now to --camera-weight,
@@ -25,9 +28,13 @@
      translation only.
 
    * Added the parameter --nodata-value. 
- - stereo_gui
 
+ - stereo_gui
    * Can view SPOT5 .BIL files.
+
+ - pc_align
+   * Add the ability to help the tool with an initial translation,
+     to be used for gross offsets. The option is --initial-ned-translation. 
 
  - Misc
    * Handle properly in bundle_adjust, orbitviz, and stereo 

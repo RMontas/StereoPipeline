@@ -34,33 +34,11 @@ sys.path.insert(0, pythonpath)
 sys.path.insert(0, libexecpath)
 sys.path.insert(0, icebridgepath)
 
-import icebridge_common, fetch_icebridge_data, process_icebridge_run, extract_icebridge_ATM_points
+import icebridge_common, fetch_icebridge_data, process_icebridge_run
+import extract_icebridge_ATM_points, camera_models_from_nav
 import asp_system_utils, asp_alg_utils, asp_geo_utils
 
 asp_system_utils.verify_python_version_is_supported()
-
-def getJpegDateTime(filepath):
-    '''Get the date and time from a raw jpeg file.'''
-    
-    # TODO: For some files it is probably in the name.
-    
-    # Use this tool to extract the metadata
-    cmd      = [asp_system_utils.which('gdalinfo'), filepath]
-    p        = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-    out, err = p.communicate()
-    
-    lines = out.split('\n')
-
-    for line in lines:
-        if 'EXIF_DateTimeOriginal' not in line:
-            continue
-        parts = line.replace('=',' ').split()
-        dateString = parts[1].strip().replace(':','')
-        timeString = parts[2].strip().replace(':','')
-        
-        return (dateString, timeString)
-
-    raise Exception('Failed to read date/time from file: ' + filepath)
 
 def convertJpegs(jpegFolder, imageFolder, startFrame, stopFrame, skipValidate, logger):
     '''Convert jpeg images from RGB to single channel.
@@ -70,36 +48,84 @@ def convertJpegs(jpegFolder, imageFolder, startFrame, stopFrame, skipValidate, l
     
     logger.info('Converting input images to grayscale...')
 
-    # Loop through all the input images
     os.system('mkdir -p ' + imageFolder)
-    jpegFiles = os.listdir(jpegFolder)
-    for jpegFile in jpegFiles:
+
+    # Loop through all the input images
+
+    jpegIndexPath = icebridge_common.csvIndexFile(jpegFolder)
+    if not os.path.exists(jpegIndexPath):
+        raise Exception("Error: Missing jpeg index file: " + jpegIndexPath + ".")
+    (jpegFrameDict, jpegUrlDict) = icebridge_common.readIndexFile(jpegIndexPath,
+                                                                  prependFolder = True)
+    
+    # Need the orthos to get the timestamp
+    orthoFolder = icebridge_common.getOrthoFolder(os.path.dirname(jpegFolder))
+    orthoIndexPath = icebridge_common.csvIndexFile(orthoFolder)
+    if not os.path.exists(orthoIndexPath):
+        raise Exception("Error: Missing ortho index file: " + orthoIndexPath + ".")
+    (orthoFrameDict, orthoUrlDict) = icebridge_common.readIndexFile(orthoIndexPath,
+                                                                  prependFolder = True)
+    
+    if not skipValidate:
+        validFilesList = icebridge_common.validFilesList(os.path.dirname(jpegFolder),
+                                                         startFrame, stopFrame)
+        validFilesSet = set()
+        validFilesSet = icebridge_common.updateValidFilesListFromDisk(validFilesList, validFilesSet)
+        numInitialValidFiles = len(validFilesSet)
         
-        inputPath = os.path.join(jpegFolder, jpegFile)
+    # Fast check for missing images. This is fragile, as maybe it gets
+    # the wrong file with a similar name, but an honest check is very slow.
+    imageFiles = icebridge_common.getTifs(imageFolder, prependFolder = True)
+    imageFrameDict = {}
+    for imageFile in imageFiles:
+        frame = icebridge_common.getFrameNumberFromFilename(imageFile)
+        if frame < startFrame or frame > stopFrame: continue
+        imageFrameDict[frame] = imageFile
         
-        # Skip non-image files
-        ext = os.path.splitext(jpegFile)[1]
-        if ext != '.JPG':
-            continue
+    for frame in sorted(jpegFrameDict.keys()):
+
+        inputPath = jpegFrameDict[frame]
         
         # Only deal with frames in range
-        frame = icebridge_common.getFrameNumberFromFilename(inputPath)
         if not ( (frame >= startFrame) and (frame <= stopFrame) ):
             continue
 
-        # Make sure the timestamp and frame number are in the output file name
-        (dateStr, timeStr) = getJpegDateTime(inputPath)
-        outputName = ('DMS_%s_%s_%05d.tif') % (dateStr, timeStr, frame)
-        outputPath = os.path.join(imageFolder, outputName)
+        if frame in imageFrameDict.keys() and skipValidate:
+            # Fast, hackish check
+            continue
 
+        if frame not in orthoFrameDict:
+            logger.info("Error: Could not find ortho image for jpeg frame: " + str(frame))
+            # Don't want to throw here. Just ignore the missing ortho
+            continue
+        
+        # Make sure the timestamp and frame number are in the output file name
+        try:
+            outputPath = icebridge_common.jpegToImageFile(inputPath, orthoFrameDict[frame])
+        except Exception, e:
+            logger.info(str(e))
+            logger.info("Removing bad file: " + inputPath)
+            os.system('rm -f ' + inputPath) # will not throw
+            badFiles = True
+            continue
+        
         # Skip existing valid files
         if skipValidate:
             if os.path.exists(outputPath):
                 logger.info("File exists, skipping: " + outputPath)
                 continue
         else:
+            if outputPath in validFilesSet and os.path.exists(outputPath):
+                #logger.info('Previously validated: ' + outputPath) # very verbose
+                validFilesSet.add(inputPath) # Must have this
+                continue
+            
             if icebridge_common.isValidImage(outputPath):
-                logger.info("File exists and is valid, skipping: " + outputPath)
+                #logger.info("File exists and is valid, skipping: " + outputPath) # verbose
+                if not skipValidate:
+                    # Mark both the input and the output as validated
+                    validFilesSet.add(inputPath) 
+                    validFilesSet.add(outputPath)
                 continue
         
         # Use ImageMagick tool to convert from RGB to grayscale
@@ -114,21 +140,40 @@ def convertJpegs(jpegFolder, imageFolder, startFrame, stopFrame, skipValidate, l
         if p.returncode != 0:
             badFiles = True
             logger.error("Command failed.")
+            logger.error("Wiping bad files: " + inputPath + " and " + outputPath + '\n'
+                         + output)
+            os.system('rm -f ' + inputPath) # will not throw
+            os.system('rm -f ' + outputPath) # will not throw
 
         if not os.path.exists(outputPath):
             badFiles = True
-            logger.error('Failed to convert jpeg file: ' + jpegFile)
+            logger.error('Failed to convert jpeg file: ' + inputPath)
+            logger.error("Wiping bad files: " + inputPath + " and " + outputPath + '\n'
+                         + output)
+            os.system('rm -f ' + inputPath) # will not throw
+            os.system('rm -f ' + outputPath) # will not throw
 
         # Check for corrupted files
         if error is not None:
             output += error
         m = re.match("^.*?premature\s+end", output, re.IGNORECASE|re.MULTILINE|re.DOTALL)
         if m:
-            logger.error("Wiping bad files: " + inputPath + " and " + outputPath +'\n'
-                         + output)
-            if os.path.exists(inputPath ): os.remove(inputPath)
-            if os.path.exists(outputPath): os.remove(outputPath)
             badFiles = True
+            logger.error("Wiping bad files: " + inputPath + " and " + outputPath + '\n'
+                         + output)
+            os.system('rm -f ' + inputPath) # will not throw
+            os.system('rm -f ' + outputPath) # will not throw
+
+    if not skipValidate:
+        # Write to disk the list of validated files, but only if new
+        # validations happened.  First re-read that list, in case a
+        # different process modified it in the meantime, such as if two
+        # managers are running at the same time.
+        numFinalValidFiles = len(validFilesSet)
+        if numInitialValidFiles != numFinalValidFiles:
+            validFilesSet = icebridge_common.updateValidFilesListFromDisk(validFilesList,
+                                                                          validFilesSet)
+            icebridge_common.writeValidFilesList(validFilesList, validFilesSet)
             
     if badFiles:
         logger.error("Converstion of JPEGs failed. If any files were corrupted, " +
@@ -136,30 +181,41 @@ def convertJpegs(jpegFolder, imageFolder, startFrame, stopFrame, skipValidate, l
     
     return (not badFiles)
             
-def correctFireballDems(demFolder, correctedDemFolder, startFrame, stopFrame, isNorth,
+def correctFireballDems(fireballFolder, corrFireballFolder, startFrame, stopFrame, isNorth,
                         skipValidate, logger):
     '''Fix the header problem in Fireball DEMs'''
 
     logger.info('Correcting Fireball DEMs ...')
 
-    # Loop through all the input images
-    os.system('mkdir -p ' + correctedDemFolder)
-    demFiles = os.listdir(demFolder)
-    badFiles = False
-    for demFile in demFiles:
+    # Read the existing DEMs
+    fireballIndexPath = icebridge_common.csvIndexFile(fireballFolder)
+    if not os.path.exists(fireballIndexPath):
+        raise Exception("Error: Missing fireball index file: " + fireballIndexPath + ".")
+        
+    (fireballFrameDict, fireballUrlDict) = \
+                        icebridge_common.readIndexFile(fireballIndexPath, prependFolder = True)
+    
+    if not skipValidate:
+        validFilesList = icebridge_common.validFilesList(os.path.dirname(fireballFolder),
+                                                         startFrame, stopFrame)
+        validFilesSet = set()
+        validFilesSet = icebridge_common.updateValidFilesListFromDisk(validFilesList, validFilesSet)
+        numInitialValidFiles = len(validFilesSet)
 
-        # Skip other files
-        inputPath = os.path.join(demFolder, demFile)
-        if not icebridge_common.isDEM(inputPath):
-            continue
+    # Loop through all the input images
+    os.system('mkdir -p ' + corrFireballFolder)
+    badFiles = False
+    for frame in sorted(fireballFrameDict.keys()):
 
         # Skip if outside the frame range
-        frame = icebridge_common.getFrameNumberFromFilename(demFile)
         if not ( (frame >= startFrame) and (frame <= stopFrame) ):
             continue
 
-        # Make sure the timestamp and frame number are in the output file name
-        outputPath = os.path.join(correctedDemFolder, os.path.basename(inputPath))
+        inputPath = fireballFrameDict[frame]
+        if not icebridge_common.isDEM(inputPath):
+            continue
+
+        outputPath = os.path.join(corrFireballFolder, os.path.basename(inputPath))
 
         # Skip existing valid files
         if skipValidate:
@@ -167,8 +223,13 @@ def correctFireballDems(demFolder, correctedDemFolder, startFrame, stopFrame, is
                 logger.info("File exists, skipping: " + outputPath)
                 continue
         else:
+            if outputPath in validFilesSet and os.path.exists(outputPath):
+                #logger.info('Previously validated: ' + outputPath) # very vebose
+                continue
+            
             if icebridge_common.isValidImage(outputPath):
-                logger.info("File exists and is valid, skipping: " + outputPath)
+                #logger.info("File exists and is valid, skipping: " + outputPath)
+                validFilesSet.add(outputPath) # mark it as validated
                 continue
         
         # Run the correction script
@@ -176,16 +237,32 @@ def correctFireballDems(demFolder, correctedDemFolder, startFrame, stopFrame, is
         cmd = (('%s %s %s %d') %
                (execPath, inputPath, outputPath, isNorth))
         logger.info(cmd)
+        # TODO: Run this as a subprocess and check the return code
         os.system(cmd)
         
         # Check if the output file is good
         if not icebridge_common.isValidImage(outputPath):
-            logger.error('Failed to convert dem file: ' + demFile)
+            logger.error('Failed to convert dem file, wiping: ' + inputPath + ' ' + outputPath)
+            os.system('rm -f ' + inputPath) # will not throw
+            os.system('rm -f ' + outputPath) # will not throw
             badFiles = True
-
-    return not badFiles
+        else:
+            if not skipValidate:
+                validFilesSet.add(outputPath) # mark it as validated
             
+    if not skipValidate:
+        # Write to disk the list of validated files, but only if new
+        # validations happened.  First re-read that list, in case a
+        # different process modified it in the meantime, such as if two
+        # managers are running at the same time.
+        numFinalValidFiles = len(validFilesSet)
+        if numInitialValidFiles != numFinalValidFiles:
+            validFilesSet = icebridge_common.updateValidFilesListFromDisk(validFilesList,
+                                                                          validFilesSet)
+            icebridge_common.writeValidFilesList(validFilesList, validFilesSet)
 
+    return (not badFiles)
+            
 def getCalibrationFileForFrame(cameraLoopkupFile, inputCalFolder, frame, yyyymmdd, site):
     '''Return the camera model file to be used with a given input frame.'''
 
@@ -238,38 +315,71 @@ def getCalibrationFileForFrame(cameraLoopkupFile, inputCalFolder, frame, yyyymmd
 
     return os.path.join(inputCalFolder, camera)
 
-def cameraFromOrthoWrapper(inputPath, orthoPath, inputCamFile, outputCamFile,
-                           refDemPath, numThreads):
+def cameraFromOrthoWrapper(inputPath, orthoPath, inputCamFile, estimatedCameraPath, 
+                           outputCamFile, refDemPath, simpleCamera, numThreads):
     '''Generate a camera model from a single ortho file'''
 
-    # If the call fails, try it again with different IP algorithm options to see
-    #  if we can get it to work.
-    IP_OPTIONS = ['1', '0', '2']
+    # Make multiple calls with different options until we get one that works well
+    IP_METHOD    = [1, 0, 2, 1, 2, 0] # IP method
+    FORCE_SIMPLE = [0, 0, 0, 0, 0, 1] # If all else fails use simple mode
+    LOCAL_NORM   = [False, False, False, True, True, False] # If true, image tiles are individually normalized with method 1 and 2
+    numAttempts = len(IP_METHOD)
    
-    MIN_IP     = 10  # Require more IP to make sure we don't get bogus camera models
-    DESIRED_IP = 100 # If we don't hit this number, try other methods before taking the best one.
+    MIN_IP     = 15  # Require more IP to make sure we don't get bogus camera models
+    DESIRED_IP = 200 # If we don't hit this number, try other methods before taking the best one.
+
+    # The max distance in meters the ortho2pinhole solution is allowed to move from the input
+    #  navigation estimate.
+    MAX_TRANSLATION = 7
 
     bestIpCount = 0
-    tempFilePath = outputCamFile + '_temp' # Used to hold the current best result
-    for ip_option in IP_OPTIONS:
+    tempFilePath  = outputCamFile + '_temp' # Used to hold the current best result
+    matchPath     = outputCamFile + '.match' # Used to hold the match file if it exists
+    tempMatchPath = matchPath + '_temp'
+
+    os.system("ulimit -c 0")  # disable core dumps
+    os.system("rm -f core.*") # these keep on popping up
+    os.system("umask 022")    # enforce files be readable by others
+        
+    for i in range(0,numAttempts):
+
+        # Get parameters for this attempt
+        ipMethod  = IP_METHOD[i]
+        localNorm = LOCAL_NORM[i]
+
+        if FORCE_SIMPLE[i]: # Always turn this on for the final attempt!
+            simpleCamera = True
 
         # Call ortho2pinhole command
         ortho2pinhole = asp_system_utils.which("ortho2pinhole")
-        cmd = (('%s %s %s %s %s --reference-dem %s --threads %d --ip-detect-method %s --minimum-ip %d') % (ortho2pinhole, inputPath, orthoPath, inputCamFile, outputCamFile, refDemPath, numThreads, ip_option, MIN_IP))
+        cmd = (('%s %s %s %s %s --reference-dem %s --crop-reference-dem --threads %d --ip-detect-method %d' \
+                ' --minimum-ip %d --max-translation %f') 
+                % (ortho2pinhole, inputPath, orthoPath, inputCamFile, outputCamFile, 
+                   refDemPath, numThreads, ipMethod, MIN_IP, MAX_TRANSLATION) )
+        if localNorm:
+            cmd += ' --skip-image-normalization'
+        if estimatedCameraPath is not None:
+            cmd += ' --camera-estimate ' + estimatedCameraPath
+        if simpleCamera:
+            cmd += ' --short-circuit'
 
         # Use a print statement as the logger fails from multiple processes
         print(cmd)
 
+        os.system('rm -f ' + matchPath) # Needs to be gone
         p = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE)
         textOutput, err = p.communicate()
         p.wait()
         print(textOutput)
-        
+
         if not os.path.exists(outputCamFile): # Keep trying if no output file produced
             continue
-        
+
+        if simpleCamera:
+            break # Never need more than one attempt with simpleCamera!
+
         # Check the number of IP used
-        m = re.findall(r"Init model with (\d+) points", textOutput)
+        m = re.findall(r"Using (\d+) points to create the camera model.", textOutput)
         if len(m) != 1: # An unknown error occurred, move on.
             continue
         numPoints = int(m[0])
@@ -278,40 +388,85 @@ def cameraFromOrthoWrapper(inputPath, orthoPath, inputCamFile, outputCamFile,
         if numPoints > bestIpCount: # Got some points but not many, try other options 
             bestIpCount = numPoints #  to see if we can beat this result.
             shutil.move(outputCamFile, tempFilePath)
+            
+            if os.path.exists(matchPath):
+                shutil.move(matchPath, tempMatchPath)
 
-    if numPoints < DESIRED_IP: # If we never got the desired # of points
+    if (not simpleCamera) and (numPoints < DESIRED_IP): # If we never got the desired # of points
         shutil.move(tempFilePath, outputCamFile) # Use the camera file with the most points found
+        if os.path.exists(tempMatchPath):
+            shutil.move(tempMatchPath, matchPath)
+        print 'Best number of ortho points = ' + str(bestIpCount)
+    else:
+        print 'Best number of ortho points = ' + str(numPoints)
     
+    os.system('rm -f ' + tempFilePath ) # Clean up these files
+    os.system('rm -f ' + tempMatchPath)
+    os.system("rm -f core.*") # these keep on popping up
+    os.system("rm -f " + outputCamFile + "*-log-*") # wipe logs
+              
     if not os.path.exists(outputCamFile):
         # This function is getting called from a pool, so just log the failure.
         print('Failed to convert ortho file: ' + orthoPath)
 
     # I saw this being recommended, to dump all print statements in the current task
     sys.stdout.flush()
-                
-    # TODO: Clean up the .gcp file?
-
 
 def getCameraModelsFromOrtho(imageFolder, orthoFolder, inputCalFolder,
-                             cameraLookupPath, yyyymmdd, site,
-                             refDemPath, cameraFolder, 
+                             cameraLookupPath, navCameraFolder,
+                             yyyymmdd, site,
+                             refDemPath, cameraFolder,
+                             simpleCameras,
                              startFrame, stopFrame,
+                             framesFile,
                              numProcesses, numThreads, logger):
     '''Generate camera models from the ortho files.
        Returns false if any files were not generated.'''
     
     logger.info('Generating camera models from ortho images...')
     
-    imageFiles = icebridge_common.getTifs(imageFolder)
-    orthoFiles = icebridge_common.getTifs(orthoFolder)
-    
+    imageFiles    = icebridge_common.getTifs(imageFolder)
+    orthoFiles    = icebridge_common.getTifs(orthoFolder)
+    if navCameraFolder != "":
+        estimateFiles = icebridge_common.getByExtension(navCameraFolder, '.tsai')
+    else:
+        estimateFiles = []
+
+    # See if to process frames from file
+    filesSet = set()
+    if framesFile != "":
+        filesSet = icebridge_common.readLinesInSet(framesFile)
+
     # Make a dictionary of ortho files by frame
+    # - The orthoFiles list contains _gray.tif as well as the original
+    #   images.  Prefer the gray versions because it saves a bit of time
+    #   in the ortho2pinhole process.
     orthoFrames = {}
     for f in orthoFiles:
+
         frame = icebridge_common.getFrameNumberFromFilename(f)
+
         if not ( (frame >= startFrame) and (frame <= stopFrame) ):
             continue
-        orthoFrames[frame] = f
+        if (framesFile != "") and (str(frame) not in filesSet):
+            continue
+
+        # Record this file if it is the first of this frame or
+        #  if it is the gray version of this frame.
+        if (frame not in orthoFrames) or ('_gray.tif' in f):
+            orthoFrames[frame] = f
+
+    # Make a dictionary of estimated camera files by frame
+    estimatedFrames = {}
+    for f in estimateFiles:
+        frame = icebridge_common.getFrameNumberFromFilename(f)
+        
+        if not ( (frame >= startFrame) and (frame <= stopFrame) ):
+            continue
+        if (framesFile != "") and (str(frame) not in filesSet):
+            continue
+
+        estimatedFrames[frame] = f
 
     imageFiles.sort()
 
@@ -332,47 +487,47 @@ def getCameraModelsFromOrtho(imageFolder, orthoFolder, inputCalFolder,
 
         # Get associated orthofile
         frame = icebridge_common.getFrameNumberFromFilename(imageFile)
+
         if not ( (frame >= startFrame) and (frame <= stopFrame) ):
             continue
+        if (framesFile != "") and (str(frame) not in filesSet):
+            continue
+
+        if not frame in orthoFrames.keys():
+            continue
+        
         orthoFile = orthoFrames[frame]
+        try:
+            estimatedCameraFile = estimatedFrames[frame]
+            estimatedCameraPath = os.path.join(navCameraFolder, estimatedCameraFile)
+        except:
+            logger.warning('Missing nav estimated camera for frame ' + str(frame))
+            estimatedCameraFile = None
+            estimatedCameraPath = None
+        
+        # Get estimated camera from nav
         
         # Check output file
-        inputPath     = os.path.join(imageFolder, imageFile)
-        orthoPath     = os.path.join(orthoFolder, orthoFile)
+        inputPath = os.path.join(imageFolder, imageFile)
+        orthoPath = os.path.join(orthoFolder, orthoFile)
+        
         outputCamFile = os.path.join(cameraFolder,
                                      icebridge_common.getCameraFileName(imageFile))
         outputFiles.append(outputCamFile)
         if os.path.exists(outputCamFile):
             logger.info("File exists, skipping: " + outputCamFile)
+            os.system("rm -f " + outputCamFile + "*-log-*") # wipe logs
             continue
 
         # Determine which input camera file will be used for this frame
         inputCamFile = getCalibrationFileForFrame(cameraLookupPath, inputCalFolder,
                                                   frame, yyyymmdd, site)
 
-        # Experimental. Using the lidar file instead of the datum works better in the open water.
-        #lidarFile = icebridge_common.findMatchingLidarFile(imageFile, lidarFolder)
-        #isSouth = icebridge_common.checkSite(site)
-        #lidarDemFile = lidarFile[:-4] + '-DEM.tif'
-        #if os.path.exists(lidarDemFile):
-        #    refDemPath = lidarDemFile
-        #else:
-        #    projString = icebridge_common.getProjection(isSouth)
-        #    lidarCsvFormatString = icebridge_common.getLidarCsvFormat(lidarFile)
-        #    cmd = "point2dem --tr 1 --search-radius-factor 4 --t_srs " + projString + ' --csv-format ' + lidarCsvFormatString + ' --datum wgs84 ' + lidarFile
-        #    suppressOutput = False
-        #    redo = False
-        #    logger.info(cmd)
-        #    asp_system_utils.executeCommand(cmd, lidarDemFile, suppressOutput, redo)
-        #    
-        #    if os.path.exists(lidarDemFile):
-        #        refDemPath = lidarDemFile 
-        #logger.info("Using dem path: " + refDemPath)
-        
         # Add ortho2pinhole command to the task pool
         taskHandles.append(pool.apply_async(cameraFromOrthoWrapper, 
                                             (inputPath, orthoPath, inputCamFile,
-                                             outputCamFile, refDemPath, numThreads)))
+                                             estimatedCameraPath, outputCamFile,
+                                             refDemPath, simpleCameras, numThreads)))
 
     # Wait for all the tasks to complete
     logger.info('Finished adding ' + str(len(taskHandles)) + ' tasks to the pool.')
@@ -389,7 +544,27 @@ def getCameraModelsFromOrtho(imageFolder, orthoFolder, inputCalFolder,
             return False
     return True
 
-def convertLidarDataToCsv(lidarFolder, logger):
+def getCameraModelsFromNav(imageFolder, orthoFolder, 
+                           inputCalFolder, navFolder, navCameraFolder,
+                           startFrame, stopFrame, 
+                           logger):
+    '''Given the folder containing navigation files, generate an
+       estimated camera model for each file.'''
+   
+    # Note: Currently these output files DO NOT contain accurate intrinsic parameters!
+
+    logger.info("Get camera models from nav.")
+    
+    # All the work is done by the separate file.
+    cmd = [imageFolder, orthoFolder, inputCalFolder, navFolder, navCameraFolder,
+           str(startFrame), str(stopFrame)]
+    logger.info("camera_models_from_nav.py " + " ".join(cmd))
+    
+    if (camera_models_from_nav.main(cmd) < 0):
+        raise Exception('Error generating camera models from nav!')
+
+def convertLidarDataToCsv(lidarFolder, startFrame, stopFrame, 
+                          skipValidate, logger):
     '''Make sure all lidar data is available in a readable text format.
        Returns false if any files failed to convert.'''
 
@@ -397,28 +572,61 @@ def convertLidarDataToCsv(lidarFolder, logger):
 
     lidarIndexPath = icebridge_common.csvIndexFile(lidarFolder)
     (frameDict, urlDict) = icebridge_common.readIndexFile(lidarIndexPath)
+
+    if not skipValidate:
+        validFilesList = icebridge_common.validFilesList(os.path.dirname(lidarFolder),
+                                                         startFrame, stopFrame)
+        validFilesSet = set()
+        validFilesSet = icebridge_common.updateValidFilesListFromDisk(validFilesList, validFilesSet)
+        numInitialValidFiles = len(validFilesSet)
+
+    convDict = {}
     
     # Loop through all files in the folder
     badFiles = False
-    for frame in frameDict:
+    for frame in sorted(frameDict.keys()):
 
         f = frameDict[frame]
         extension = icebridge_common.fileExtension(f)
         
         # Only interested in a few file types
         if (extension != '.qi') and (extension != '.hdf5') and (extension != '.h5'):
-           continue
+            convDict[frame] = f # these are already in plain text
+            continue
+
+        convDict[frame] = os.path.splitext(f)[0] + '.csv'
+        outputPath = os.path.join(lidarFolder, convDict[frame])
 
         # Handle paths
         fullPath = os.path.join(lidarFolder, f)
         if not os.path.exists(fullPath):
             logger.info("Cannot convert missing file: " + fullPath)
             continue
-        
-        outputPath = os.path.join(lidarFolder, os.path.splitext(f)[0]+'.csv')
-        if icebridge_common.isValidLidarCSV(outputPath):
-            logger.info("File exists and is valid, skipping: " + outputPath)
+
+        # If the input is invalid, wipe both it, its xml, and the output
+        # Hopefully there will be a subsquent fetch step where it will get
+        # refetched.
+        if not icebridge_common.hasValidChkSum(fullPath, logger):
+            logger.info("Will wipe invalid file: " + fullPath)
+            xmlFile = icebridge_common.xmlFile(fullPath)
+            os.system('rm -f ' + fullPath) # will not throw
+            os.system('rm -f ' + xmlFile) # will not throw
+            os.system('rm -f ' + outputPath) # will not throw
+            badFiles = True
             continue
+
+        # Skip existing valid files
+        if skipValidate:
+            if os.path.exists(outputPath):
+                logger.info("File exists, skipping: " + outputPath)
+                continue
+        else:
+            if outputPath in validFilesSet and os.path.exists(outputPath):
+                #logger.info('Previously validated: ' + outputPath) # verbose
+                continue
+            if icebridge_common.isValidLidarCSV(outputPath):
+                #logger.info("File exists and is valid, skipping: " + outputPath)
+                continue
         
         # Call the conversion
         logger.info("Process " + fullPath)
@@ -426,31 +634,61 @@ def convertLidarDataToCsv(lidarFolder, logger):
         
         # Check the result
         if not icebridge_common.isValidLidarCSV(outputPath):
-            logger.error('Failed to parse LIDAR file: ' + fullPath)
+            logger.error('Failed to parse LIDAR file, will wipe: ' + outputPath)
+            os.system('rm -f ' + outputPath) # will not throw            
             badFiles = True
+        else:
+            if not skipValidate:
+                validFilesSet.add(outputPath) # mark it as validated
             
-    return not badFiles
+    convLidarFile = icebridge_common.getConvertedLidarIndexFile(lidarFolder)
+    if not os.path.exists(convLidarFile):
+        logger.info("Writing: " + convLidarFile)
+        icebridge_common.writeIndexFile(convLidarFile, convDict, {})
+        
+    if not skipValidate:
+        # Write to disk the list of validated files, but only if new
+        # validations happened.  First re-read that list, in case a
+        # different process modified it in the meantime, such as if two
+        # managers are running at the same time.
+        numFinalValidFiles = len(validFilesSet)
+        if numInitialValidFiles != numFinalValidFiles:
+            validFilesSet = icebridge_common.updateValidFilesListFromDisk(validFilesList,
+                                                                          validFilesSet)
+            icebridge_common.writeValidFilesList(validFilesList, validFilesSet)
 
-def pairLidarFiles(lidarFolder, logger):
+    return (not badFiles)
+
+def pairLidarFiles(lidarFolder, skipValidate, logger):
     '''For each pair of lidar files generate a double size point cloud.
        We can use these later since they do not have any gaps between adjacent files.'''
     
     logger.info('Generating lidar pairs...')
 
     # Create the output folder
-    pairFolder = os.path.join(lidarFolder, 'paired')
-    os.system('mkdir -p ' + pairFolder)
+    pairedFolder = icebridge_common.getPairedLidarFolder(lidarFolder)
+    os.system('mkdir -p ' + pairedFolder)
 
-    (lidarFiles, lidarExt, isLVIS) = icebridge_common.lidarFiles(lidarFolder)
-    
-    numLidarFiles = len(lidarFiles)
+    convLidarFile = icebridge_common.getConvertedLidarIndexFile(lidarFolder)
+    if not os.path.exists(convLidarFile):
+        raise Exception("Missing file: " + convLidarFile)
+
+    (lidarDict, dummyUrlDict) = icebridge_common.readIndexFile(convLidarFile)
+    lidarExt = ''
+    for frame in lidarDict:
+        lidarExt = icebridge_common.fileExtension(lidarDict[frame])
+
+    numLidarFiles = len(lidarDict.keys())
+
+    pairedDict = {}
     
     # Loop through all pairs of csv files in the folder    
     badFiles = False
-    for i in range(0, numLidarFiles-1):
-
-        thisFile = lidarFiles[i  ]
-        nextFile = lidarFiles[i+1]
+    lidarKeys = sorted(lidarDict.keys())
+    for i in range(len(lidarKeys)-1):
+        
+        thisFile = lidarDict[lidarKeys[i  ]]
+        nextFile = lidarDict[lidarKeys[i+1]]
 
         date2, time2 = icebridge_common.parseTimeStamps(nextFile)
         
@@ -458,14 +696,33 @@ def pairLidarFiles(lidarFolder, logger):
         # - More useful because the time for the second file represents the middle of the file.
         outputName = icebridge_common.lidar_pair_prefix() + date2 +'_'+ time2 + lidarExt
 
+        pairedDict[lidarKeys[i]] = outputName
+        
         # Handle paths
         path1      = os.path.join(lidarFolder, thisFile)
         path2      = os.path.join(lidarFolder, nextFile)
-        outputPath = os.path.join(pairFolder, outputName)
-        if icebridge_common.isValidLidarCSV(outputPath):
-            logger.info("Valid lidar file: " + outputPath)
+        outputPath = os.path.join(pairedFolder, outputName)
+
+        if not os.path.exists(path1) or not os.path.exists(path2):
+            logger.info("Cannot create " + outputPath + " as we are missing its inputs")
+            # If the inputs are missing, but the output is there, most likely it is corrupt.
+            # Wipe it. Hopefully a subsequent fetch and convert step will bring it back.
+            if os.path.exists(outputPath):
+                logger.info("Wiping: " + outputPath)
+                os.system('rm -f ' + outputPath) # will not throw
+                badFiles = True
             continue
         
+        # Skip existing valid files
+        if skipValidate:
+            if os.path.exists(outputPath):
+                logger.info("File exists, skipping: " + outputPath)
+                continue
+        else:
+            if icebridge_common.isValidLidarCSV(outputPath):
+                #logger.info("File exists and is valid, skipping: " + outputPath)
+                continue
+
         # Concatenate the two files
         cmd1 = 'cat ' + path1 + ' > ' + outputPath
         cmd2 = 'tail -n +2 -q ' + path2 + ' >> ' + outputPath
@@ -477,9 +734,15 @@ def pairLidarFiles(lidarFolder, logger):
         out, err = p.communicate()
 
         if not icebridge_common.isValidLidarCSV(outputPath):
-            logger.error('Failed to generate merged LIDAR file: ' + outputPath)
+            logger.error('Failed to generate merged LIDAR file, will wipe: ' + outputPath)
+            os.system('rm -f ' + outputPath) # will not throw
             badFiles = True
-            
-    return badFiles
+
+    pairedLidarFile = icebridge_common.getPairedIndexFile(pairedFolder)
+    if not os.path.exists(pairedLidarFile):
+        logger.info("Writing: " + pairedLidarFile)
+        icebridge_common.writeIndexFile(pairedLidarFile, pairedDict, {})
+
+    return (not badFiles)
 
 

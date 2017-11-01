@@ -120,10 +120,18 @@ namespace asp {
        "Interest point detection algorithm (0: Integral OBALoG (default), 1: OpenCV SIFT, 2: OpenCV ORB.")
       ("epipolar-threshold",       po::value(&global.epipolar_threshold)->default_value(-1),
                      "Maximum distance from the epipolar line to search for IP matches. Default: automatic calculation.")
+      ("ip-edge-buffer",          po::value(&global.ip_edge_buffer_percent)->default_value(0),
+       "Remove IP within this percentage from the outer edges of an image pair (integer percent).")
+      ("normalize-ip-tiles", po::bool_switch(&global.ip_normalize_tiles)->default_value(false)->implicit_value(true),
+       "Individually normalize tiles used for IP detection.")
       ("ip-inlier-factor",          po::value(&global.ip_inlier_factor)->default_value(1.0/15.0),
        " A higher factor will result in more interest points, but perhaps also more outliers.")
       ("ip-uniqueness-threshold",          po::value(&global.ip_uniqueness_thresh)->default_value(0.7),
        "Min percentage distance between closest and second closest IP descriptors, a larger value allows more IP matches.")
+      ("disable-tri-ip-filter",     po::value(&global.disable_tri_filtering)->default_value(false)->implicit_value(true),
+                      "Turn off tri-ip filtering step.")
+      ("ip-debug-images",     po::value(&global.ip_debug_images)->default_value(false)->implicit_value(true),
+                      "Write debug images to disk when detecting and matching interest points.")
       ("num-obalog-scales",              po::value(&global.num_scales)->default_value(-1),
        "How many scales to use if detecting interest points with OBALoG. If not specified, 8 will be used. More can help for images with high frequency artifacts.")
       ("nodata-value",             po::value(&global.nodata_value)->default_value(nan),
@@ -151,6 +159,8 @@ namespace asp {
                      "Preprocessing filter mode. [0 None, 1 Gaussian, 2 LoG, 3 Sign of LoG]")
       ("corr-seed-mode",         po::value(&global.seed_mode)->default_value(1),
                      "Correlation seed strategy. [0 None, 1 Use low-res disparity from stereo, 2 Use low-res disparity from provided DEM (see disparity-estimation-dem), 3 Use low-res disparity produced by sparse_disp (in development)]")
+      ("min-num-ip",             po::value(&global.min_num_ip)->default_value(30),
+                     "The minimum number of interest points which must be found to estimate the search range.")
       ("corr-sub-seed-percent",  po::value(&global.seed_percent_pad)->default_value(0.25),
                      "Percent fudge factor for disparity seed's search range.")
       ("cost-mode",              po::value(&global.cost_mode)->default_value(2),
@@ -194,7 +204,7 @@ namespace asp {
       ("corr-timeout",           po::value(&global.corr_timeout)->default_value(900),
                      "Correlation timeout for a tile, in seconds.")
       ("stereo-algorithm",       po::value(&global.stereo_algorithm)->default_value(0),
-                     "Stereo algorithm to use [0=local window, 1=SGM, 2=Smooth SGM].")
+                     "Stereo algorithm to use [0=local window, 1=SGM, 2=MGM, 3=MGM Final].")
       ("corr-blob-filter",       po::value(&global.corr_blob_filter_area)->default_value(0),
                      "Filter blobs this size or less in correlation pyramid step.")
       ("corr-tile-size",         po::value(&global.corr_tile_size_ovr)->default_value(ASPGlobalOptions::corr_tile_size()),
@@ -310,6 +320,7 @@ namespace asp {
                                             "Use rigorous least squares triangulation process. This is slow for ISIS processes.")
       ("bundle-adjust-prefix", po::value(&global.bundle_adjust_prefix),
        "Use the camera adjustments obtained by previously running bundle_adjust with this output prefix.")
+      ("num-matches-from-disparity", po::value(&global.num_matches_from_disparity)->default_value(0), "An experimental option to create, after stereo, a match file with this many points sampled from the stereo disparity. The matches are between original images (that is, before any alignment or map-projection). The match file is saved as {output-prefix}-disp.match.")
       ("image-lines-per-piecewise-adjustment", po::value(&global.image_lines_per_piecewise_adjustment)->default_value(0), "A positive value, e.g., 1000, will turn on using piecewise camera adjustments to help reduce jitter effects. Use one adjustment per this many image lines.")
       ("piecewise-adjustment-percentiles",     po::value(&global.piecewise_adjustment_percentiles)->default_value(Vector2(5, 95), "5 95"), "A narrower range will place the piecewise adjustments for jitter correction closer together and further from the first and last lines in the image.")
       ("piecewise-adjustment-interp-type", po::value(&global.piecewise_adjustment_interp_type)->default_value(1), "How to interpolate between adjustments. [1 Linear, 2 Using Gaussian weights]")

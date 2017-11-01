@@ -118,9 +118,6 @@ namespace asp {
     }
 
     bool nadir_facing = this->is_nadir_facing();
-
-    if (stereo_settings().skip_rough_homography) 
-      nadir_facing = false;
     
     bool inlier = false;
     if (nadir_facing) {
@@ -173,16 +170,32 @@ namespace asp {
       vw_out() << "Using epipolar threshold = " << epipolar_threshold << std::endl;
       vw_out() << "IP uniqueness threshold     = " << ip_uniqueness_thresh  << std::endl;
 
-      inlier = ip_matching_w_alignment(single_threaded_camera, cam1, cam2,
-                                       image1_norm, image2_norm,
-                                       ip_per_tile,
-                                       datum, match_filename,
-                                       epipolar_threshold, ip_uniqueness_thresh,
-                                       nodata1, nodata2);
+      if (stereo_settings().skip_rough_homography) {
+        inlier = ip_matching_no_align(single_threaded_camera, cam1, cam2,
+                             image1_norm, image2_norm,
+                             ip_per_tile,
+                             datum, match_filename,
+                             epipolar_threshold, ip_uniqueness_thresh,
+                             nodata1, nodata2);              
+      }
+      else {
+        inlier = ip_matching_w_alignment(single_threaded_camera, cam1, cam2,
+                                         image1_norm, image2_norm,
+                                         ip_per_tile,
+                                         datum, match_filename,
+                                         epipolar_threshold, ip_uniqueness_thresh,
+                                         nodata1, nodata2);
+      }
     } else { // Not nadir facing
       // Run a simpler purely image based matching function
       double ip_inlier_factor = stereo_settings().ip_inlier_factor;
       int    inlier_threshold = round(ip_inlier_factor*150.0); // by default this is 10.
+      
+      // HACK: If the otherwise unused epipolar threshold is set, use it as
+      //       the inlier threshold.
+      if (stereo_settings().epipolar_threshold > 0)
+        inlier_threshold = stereo_settings().epipolar_threshold;
+
       inlier = homography_ip_matching( image1_norm, image2_norm,
                                        ip_per_tile,
                                        match_filename,

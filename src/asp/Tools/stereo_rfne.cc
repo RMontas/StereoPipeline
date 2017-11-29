@@ -35,7 +35,7 @@ using namespace asp;
 using namespace std;
 
 //<RM>: Added DEBUG_RM flag 
-#define DEBUG_RM 0
+#define DEBUG_RM 1
 
 namespace vw {
   template<> struct PixelFormatID<PixelMask<Vector<float, 5> > >   { static const PixelFormatEnum value = VW_PIXEL_GENERIC_6_CHANNEL; };
@@ -242,7 +242,7 @@ public:
 	  int W = bbox.min().x()/ts;
 	  int H = bbox.min().y()/ts;
 #endif
-	  int margin = 100;
+	  int margin = ts * 0.3;
 	  BBox2i newBBox = bbox;
 	  newBBox.expand(margin);
 	  newBBox.crop(bounding_box(m_left_image));

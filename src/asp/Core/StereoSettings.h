@@ -46,11 +46,23 @@ namespace asp {
     std::string out_prefix;
     
     // Constants
-    static int   corr_tile_size() { return 1024; } // Tile size for correlation
+    //static int   corr_tile_size() { return 1024; } // Tile size for correlation
    // static int   rfne_tile_size() { return 256;  } // Tile size for refinement
     static int   tri_tile_size()  { return 256;  } // Tile size for tri/point cloud
-// RM
-	static int   rfne_tile_size() { return 1024;  } // Tile size for refinement
+	static int   corr_tile_size() {
+    	char * ptr = getenv("TILE_SIZE");
+     	if (ptr != NULL)
+			return atoi(ptr);
+     	else
+			return 1024;
+   	}
+	static int   rfne_tile_size() {
+    	char * ptr = getenv("TILE_SIZE");
+     	if (ptr != NULL) 
+			return atoi(ptr);
+		else
+			return 1024;
+   	}
   };
 
   // Program Options for each executable/step

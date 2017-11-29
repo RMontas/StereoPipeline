@@ -53,7 +53,7 @@ using namespace asp;
 using namespace std;
 
 //<RM>: Added DEBUG_RM flag 
-#define DEBUG_RM 0
+#define DEBUG_RM 1
 //<RM>: Added functions
 // NOT being used //
 template <class Image1T, class Image2T>
@@ -1039,9 +1039,9 @@ public:
 	//<RM>: Added variables
 	//<RM>: increase bbox where the piecewise alignment is applied to reduce border artifacts
 	Stopwatch swGlobal; swGlobal.start();
-	int margin = 100; 
 	BBox2f new_local_search_range;
 	int ts = ASPGlobalOptions::corr_tile_size();
+	int margin = ts * 0.3; 
 #if DEBUG_RM
   	cout << "start of tile " << bbox << endl;
 	char outputName[30];

@@ -35,7 +35,7 @@ using namespace asp;
 using namespace std;
 
 //<RM>: Added DEBUG_RM flag 
-#define DEBUG_RM 1
+#define DEBUG_RM 0
 
 namespace vw {
   template<> struct PixelFormatID<PixelMask<Vector<float, 5> > >   { static const PixelFormatEnum value = VW_PIXEL_GENERIC_6_CHANNEL; };
@@ -186,8 +186,8 @@ class PerTileRfne: public ImageViewBase<PerTileRfne<Image1T, Image2T, SeedDispT>
   SeedDispT            m_integer_disp;
   SeedDispT            m_sub_disp;
   ImageView<Matrix3x3> m_local_hom;
-  ImageView<Matrix3x3> m_local_hom_L; //<RM>: added to support affineepipolar piecewise alignment method
-  ImageView<Matrix3x3> m_local_size; //<RM>: added to support affineepipolar piecewise alignment method
+  ImageView<Matrix3x3> m_local_hom_L; //<RM>: 
+  ImageView<Matrix3x3> m_local_size; //<RM>:
   ASPGlobalOptions const&       m_opt;
   Vector2              m_upscale_factor;
 
@@ -234,7 +234,6 @@ public:
 	ImageView<pixel_type> tile_disparity(bbox.width(), bbox.height());
     bool verbose = false;
     if (stereo_settings().seed_mode > 0 && stereo_settings().use_local_homography){
-		//<RM>: Added DEBUG_RM flag 
       int ts = ASPGlobalOptions::corr_tile_size();
 #if DEBUG_RM
 	  cartography::GdalWriteOptions geo_opt;
@@ -242,7 +241,7 @@ public:
 	  int W = bbox.min().x()/ts;
 	  int H = bbox.min().y()/ts;
 #endif
-	  int margin = ts * 0.3;
+	  int margin = ts * 0.4; //<RM>: Has to be the same for stereo_corr
 	  BBox2i newBBox = bbox;
 	  newBBox.expand(margin);
 	  newBBox.crop(bounding_box(m_left_image));
@@ -283,7 +282,6 @@ public:
 	  sprintf(outputName, "aligned_R_%d_%d.tif", H, W);
 	  vw::cartography::block_write_gdal_image(outputName, right_trans_img, geo_opt);
 #endif
-// Ricardo Monteiro
 	  typedef float left_pix_type;
       ImageViewRef< PixelMask<left_pix_type> > left_trans_masked_img
         = transform (copy_mask( tile_left_image, create_mask(tile_left_image_mask) ),
@@ -323,28 +321,16 @@ public:
 	  // adding margin for non edge cases
 	  double marginMinX = bbox.min().x() == 0 ? 0 : margin;
 	  double marginMinY = bbox.min().y() == 0 ? 0 : margin;
-// overwrite tile_disparity by adjusting right tile and calculating the new disparity (unaligned L and unaligned R)
+	  //<RM>: overwrite tile_disparity by adjusting right tile and calculating the new disparity (unaligned L and unaligned R)
 	  for(int j=0; j<bbox.height(); j++ ){
 		for(int i=0; i<bbox.width(); i++ ){
-			/*Vector2 pixel_L = HomographyTransform(fullres_hom_L).forward(Vector2(i+marginMinX,j+marginMinY)); // L trans
-			float dx = tile_disparity_trans_inv(i,j)[0]; // D -> R trans to L trans
-			float dy = tile_disparity_trans_inv(i,j)[1];
-			Vector2 pixel_R = pixel_L + Vector2(dx,dy); // R trans
-			Vector2 disp_L_R = pixel_R - Vector2(i+marginMinX,j+marginMinY); // D -> R trans to L NO trans
-			pixel_R = HomographyTransform(fullres_hom).forward(Vector2(i+marginMinX,j+marginMinY)); // R trans
-			pixel_L = pixel_R - disp_L_R; // L NO trans
-			disp_L_R = Vector2(i+marginMinX,j+marginMinY) - pixel_L; // D -> R NO trans to L NO trans
-			tile_disparity(i,j)[0] = disp_L_R.x();
-			tile_disparity(i,j)[1] = disp_L_R.y();
-			if(tile_disp_image_mask(i,j))
-				validate(tile_disparity(i,j));*/
 			Vector2 pixel_L = Vector2(i,j);
 			Vector2 pixel_L_buf = Vector2(i+marginMinX,j+marginMinY);
-			Vector2 pixel_L_trans = HomographyTransform(fullres_hom_L).forward(pixel_L_buf); // L trans
-			float dx = tile_disparity_trans_inv(i,j)[0]; // D -> R trans to L trans
+			Vector2 pixel_L_trans = HomographyTransform(fullres_hom_L).forward(pixel_L_buf); //<RM>: L trans
+			float dx = tile_disparity_trans_inv(i,j)[0]; //<RM>: D -> R trans to L trans
 			float dy = tile_disparity_trans_inv(i,j)[1];
-			Vector2 pixel_R_trans = pixel_L_trans + Vector2(dx,dy); // R trans
-			Vector2 pixel_R_buf = HomographyTransform(inverse(fullres_hom)).forward(pixel_R_trans); // R NO trans
+			Vector2 pixel_R_trans = pixel_L_trans + Vector2(dx,dy); //<RM>: R trans
+			Vector2 pixel_R_buf = HomographyTransform(inverse(fullres_hom)).forward(pixel_R_trans); //<RM>: R NO trans
 			Vector2 pixel_R = pixel_R_buf - Vector2(marginMinX, marginMinY);
 			Vector2 disp_L_R = pixel_R - pixel_L;
 			tile_disparity(i,j)[0] = disp_L_R.x();
